@@ -97,14 +97,26 @@ User (Telegram)
     through _SweepThrottle (one at a time by default; the gap widens, and then
     the sweep pauses outright, as 401/403 blocks pile up)
 3.  Per account:
-    a.  InstagramClient.fetch_profile()  →  200 JSON from Instagram
-    b.  InstagramClient.fetch_hd_pic_url()  →  mobile API for full-res picture
-    c.  MediaHasher.hash_url()  →  download + perceptual hash
-    d.  detect_changes(previous_snapshot, new_snapshot)
-    e.  If changed: INSERT AccountSnapshot, log NotificationLog
-    f.  NotificationDispatcher sends text diff + picture document
+    a.  InstagramClient.probe_by_id(stored id)  →  current username, avatar,
+        story/live status, highlight catalog (graphql reel query, BY ID).
+        A changed username is persisted + announced here (_apply_rename);
+        a 404 by id means the account is gone, not renamed
+    b.  InstagramClient.fetch_profile(username)  →  200 JSON from Instagram.
+        The API is skipped for the rest of the sweep once it has refused
+        SWEEP_BREAKER_THRESHOLD lookups in a row with none answering; the
+        page doors still run — this host's own request, then the home
+        fetcher (HOME_FETCH_TOKEN: a phone/PC on a trusted connection that
+        polls /home-fetch/jobs for work)
+    c.  If (b) is blocked but (a) answered: an id-only PARTIAL reading —
+        username + picture live, everything else carried forward, labelled
+    d.  MediaHasher.hash_url()  →  download + perceptual hash
+    e.  detect_changes(previous_snapshot, new_snapshot)
+    f.  If changed: INSERT AccountSnapshot, log NotificationLog
+    g.  NotificationDispatcher sends text diff + picture document
 4.  _retry_blocked() re-checks anything the gate blocked, in paced rounds —
-    a 401 blocks a request, not an account, so most recover here
+    a 401 blocks a request, not an account, so most recover here. Skipped
+    when the gate is down or the username door closed (nothing to retry
+    through)
 5.  StoriesClient checks stories/highlights; the story/live status is announced
     only when it changed and the media didn't already announce it
 6.  Sweep-complete summary notification sent
@@ -267,7 +279,7 @@ x-ig-app-id: 936619743392459
   `random.uniform(1.0, 3.0)` jitter — a datacenter IP gets these
   intermittently and a re-ask often lands
 - 401/403 **through the Worker**: budgeted by the caller, because one Worker
-  call is already 8 upstream attempts. A sweep passes
+  call is already 6 upstream attempts. A sweep passes
   `IG_SWEEP_AUTH_ATTEMPTS` (1); on-demand callers get
   `IG_MANUAL_AUTH_ATTEMPTS` (3). The re-ask is worth something because a
   repeat call may leave from a different Cloudflare colo, and Instagram's
@@ -275,7 +287,11 @@ x-ig-app-id: 936619743392459
   every account, and that traffic is what keeps the gate shut
 - 429: exponential backoff, capped at 60s
 - 5xx: exponential backoff, capped at 30s
-- 404: return immediately, no retry (rename recovery handles it)
+- 404: return immediately, no retry. A username 404 is read against the
+  id route, which ran first: the id still answering under the same name
+  is a glitch (quiet); the id gone means deactivated/deleted (announced at
+  once); the id route blocked means a rename can't be confirmed (announced
+  on the second consecutive miss and every 5th after)
 
 **Proxy path:** When `IG_PROXY_URL` is set, requests are routed through the
 Cloudflare Worker instead of hitting Instagram directly.
@@ -376,6 +392,17 @@ sweep itself is paced by `_SweepThrottle`:
   answered, the gate is shut: stop immediately, skip the retry rounds, and
   skip the per-account reel fallback, because no pace helps and every further
   request is blocked traffic that keeps it shut.
+- **Two doors, booked separately** (2026-09-05). The username route
+  (`web_profile_info`) and the numeric-id route (graphql reel query) are
+  counted on their own. `SWEEP_BREAKER_THRESHOLD` refused username lookups
+  in a row with none answering closes THAT door for the rest of the sweep —
+  the remaining accounts are checked by id only, and the retry rounds re-ask
+  anything still blocked by id only — while the gate counts as shut only when
+  the id route answered nothing either. The verdict is remembered
+  (`username_api_closed_at` in app_settings, `USERNAME_API_RECHECK_SECONDS`):
+  the next sweep knocks once instead of THRESHOLD times, manual checks skip
+  the API, and one answering knock reopens it. A check where either route answered is a success for
+  pacing.
 - **Retry rounds** (`SWEEP_RETRY_ROUNDS`, cooldown doubling 30s → 60s → 120s,
   bounded by `SWEEP_RETRY_BUDGET_SECONDS`) re-check blocked accounts one at a
   time. A block lands on a *request*, not an account, so a paced retry often
@@ -479,10 +506,14 @@ Cloudflare Worker proxy is used for EVERY Instagram API call:
 - URL: `https://ig-proxy.m-asaad2005-ma.workers.dev`
 - `?username=<x>` → web_profile_info (profile fields)
 - `?user_id=<id>` → graphql reel query (story/live status, highlight catalog,
-  username-by-id — powers `/add <numeric id>` and the ✨ Highlights button)
-- `?hd_user_id=<id>` → mobile API user info (HD profile picture; only useful
-  with a logged-in session, which the anonymous setup doesn't use)
-- Rotates across 6 user agents, retries 8 times; a 200 with a non-JSON body
+  username-by-id, avatar URL — powers `/add <numeric id>`, the ✨ Highlights
+  button and, since 2026-09-05, the FIRST question of every check
+  (`probe_by_id`): the route Instagram still answers anonymously while
+  `?username=` gets a 401 login wall)
+- `?hd_user_id=<id>` → mobile API user info (anonymously: pk, username and a
+  150px avatar — the probe's fallback when the reel payload lacks one; the
+  HD picture needs a logged-in session, which the anonymous setup doesn't use)
+- Rotates across 6 user agents, retries 6 times; a 200 with a non-JSON body
   (login-wall HTML) counts as blocked and is retried
 - Free tier: 100,000 requests/day
 
@@ -501,14 +532,67 @@ this design:
   reputation attached to them is everyone's aggregate traffic, not yours. This
   is why blocks flip per colo and differ per account, and why the same username
   can 401 one minute and answer the next.
-- The 8 upstream attempts inside one call all leave from the **same colo with
+- The 6 upstream attempts inside one call all leave from the **same colo with
   the same TLS fingerprint** — they vary the User-Agent and host, which are not
   what the gate keys on. Separate calls have a chance at a different colo,
   which is why the manual path re-asks and the sweep does not.
 - A Worker hop also **loses the Chrome TLS fingerprint**: the runtime's own
   handshake carries a header claiming to be Chrome. That mismatch is a stronger
   signal than either fact alone, and it is why the public-page fallback is
-  fetched directly instead.
+  fetched directly instead. (Measured 2026-09-05 with a `?page=` route: the
+  edge is bounced to the login page and answered 429 regardless — the IP,
+  not the fingerprint, is what decides. The route stays for re-tests.)
+
+### 6.8 Home page fetcher
+
+`tools/home_fetcher/home_fetcher.py` — a stdlib-only worker (curl_cffi used
+when present) you run on a device whose connection Instagram trusts: an old
+Android phone in Termux, or your PC. It PULLS work: `GET /home-fetch/jobs`
+long-polls the bot (header `X-Watcher-Token`), the worker fetches
+`instagram.com/<username>/` with Chrome's navigation headers, and POSTs
+Instagram's status and HTML to `/home-fetch/jobs/<id>` (gzip). Nothing dials
+into the home network — it sits behind carrier-grade NAT and an unrooted phone
+can run neither a port forward nor a Tailscale Funnel. `app/monitor/home_fetch.py`
+is the in-memory broker that matches jobs to waiting checks;
+`InstagramClient.probe_home_page` parses the same Relay payload the direct page
+door does, so the reading is a normal `source="public_page"` partial. Order on
+the username side: the API (unless skipped for the sweep), this host's page
+request, the home fetcher. A worker that has not polled for 90 s is "not
+connected": a fast, quiet answer — the sweep stays id-only. About 700 KB per
+page from Instagram, a few KB (the extracted payload) back to the bot.
+
+The sweep never waits on the phone by design. It hands the broker its whole
+list up front (`broker.prefetch`) — at sweep start when the username API is
+known shut, else at the first refusal — and the phone works through it, a
+batch per poll (`?batch=8`), uploading in the background, while the sweep
+does its id probes. Each check then finds its page in the broker's cache
+(`cached_page_ok`, fresh for 15 min; manual checks ask fresh) and only waits
+when it is still on its way. Every delivery logs the pickup and delivery
+latency, so a slow link shows up as numbers, not as a slow sweep. The worker
+keeps one connection per thread alive (`BotLink`) and tries IPv4 first — a
+fresh DNS + TLS setup per request cost ~30 s on the phone.
+
+The page also carries `latest_reel_media` (0 = no active story, else its
+timestamp; verified against the reel query). When the reel route refuses an
+account, `_handle_success` builds the story status from the page
+(`reel_data["from_page"]`), the story phase does not knock on the reel route
+again, and the highlight catalog is left as stored. The sweep summary ends with
+a home-fetcher line: connection, pages this sweep, battery.
+
+Reel queries go through the phone too (job kind `reel`, keyed by numeric id;
+a worker declares what it fetches in `X-Watcher-Kinds`). `check_all` prefetches
+every account's reel query at sweep start; `probe_by_id(cached_ok=True)` reads
+the phone's answer from the broker's cache first, then the Worker, and after
+three Worker refusals in a row asks the phone live first for 10 minutes. A
+sweep's guard counts a page-served check as answered (`status == 200`), not
+by the API door alone — the bug that paused sweeps and widened the gap.
+
+This host's own page request is bounded to 12 s and, after three refusals in
+a row (429, login redirect, empty shell, timeout), skipped for 30 minutes so
+the home fetcher is asked at once (`/probe` still forces a measurement).
+Every check logs one timing line — `@user took 4.1s (id 1.0s, username side
+2.9s, direct 0.3s, home 2.4s, diff+store 0.2s)` — so a slow sweep names the
+slow door.
 
 The durable fix within a login-free design is a residential/mobile proxy
 (`IG_PROXY_URL` unset, `PROXY_URL` set), which gets a consumer-ASN IP *and*
@@ -641,7 +725,7 @@ All settings are read from environment variables (or a `.env` file locally).
 |---|---|---|
 | `IG_SESSION_COOKIE` | — | Full cookie string from a logged-in browser session (enables HD profile pictures). Optional — login-free is the default and recommended mode |
 | `IG_PROXY_URL` | — | Cloudflare Worker proxy URL for datacenter IP bypass |
-| `IG_SWEEP_AUTH_ATTEMPTS` | `1` | Worker re-asks per blocked check during a sweep (each call is already 8 upstream attempts) |
+| `IG_SWEEP_AUTH_ATTEMPTS` | `1` | Worker re-asks per blocked check during a sweep (each call is already 6 upstream attempts) |
 | `IG_MANUAL_AUTH_ATTEMPTS` | `3` | Worker re-asks for an on-demand check — a repeat call may land on a different colo |
 
 ### Scheduler
@@ -814,7 +898,7 @@ Worker behavior:
 - Accepts `?username=<x>`
 - Forwards to `https://www.instagram.com/api/v1/users/web_profile_info/?username=<x>`
 - Rotates 6 user agents on each retry attempt
-- Retries 8 times
+- Retries 6 times
 
 **Config:** Set `IG_PROXY_URL=https://ig-proxy.m-asaad2005-ma.workers.dev` in Render
 environment variables.

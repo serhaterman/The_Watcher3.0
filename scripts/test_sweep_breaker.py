@@ -28,9 +28,17 @@ if str(ROOT) not in sys.path:
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "x")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "1")
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+# A file, not :memory: — the sweep now persists its verdict on the username
+# API door as it closes, and every aiosqlite connection to :memory: is its
+# own empty database.
+DB_FILE = Path(__file__).resolve().parents[1] / "test_sweep_breaker.db"
+if DB_FILE.exists():
+    DB_FILE.unlink()
+os.environ.setdefault("DATABASE_URL", f"sqlite+aiosqlite:///{DB_FILE.as_posix()}")
 
 from app.config import settings  # noqa: E402
+from app.database.models import Base  # noqa: E402
+from app.database.session import dispose_engine, engine  # noqa: E402
 from app.monitor import service as service_mod  # noqa: E402
 from app.monitor.service import MonitorService, _SweepThrottle  # noqa: E402
 
@@ -302,7 +310,7 @@ async def test_retry_rounds_recover_blocked_accounts() -> None:
     expect("the recovered account is marked ok in place",
            outcomes[1][2].get("ok") is True, repr(outcomes[1][2]))
     expect("a real block stays failed", outcomes[2][2].get("ok") is False)
-    expect("a 404 is never retried (rename recovery handles it)",
+    expect("a 404 is never retried (a real answer, read against the id route)",
            "gone" not in attempts, repr(attempts))
     expect("a healthy account is never re-checked", "good" not in attempts)
     expect("retries stop once an account recovers", attempts["flaky"] == 2,
@@ -337,6 +345,9 @@ async def test_retry_budget_stops_a_long_outage() -> None:
 
 
 async def main() -> int:
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
     test_healthy_sweep_stays_at_base()
     test_stagger_widens_then_relaxes()
     test_stagger_caps_at_max()
@@ -351,6 +362,7 @@ async def main() -> int:
     await test_retry_budget_stops_a_long_outage()
     await test_staggered_check_defers_after_open()
 
+    await dispose_engine()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {', '.join(FAILURES)}")

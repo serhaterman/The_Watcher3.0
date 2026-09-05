@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import secrets
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
@@ -11,6 +13,7 @@ from telegram import Update
 from app.config import settings
 from app.database import crud
 from app.database.session import get_session
+from app.monitor import home_fetch
 from app.monitor.health import fetch_health
 from app.monitor.service import MonitorService
 from app.utils.logger import logger
@@ -131,6 +134,116 @@ async def trigger_sweep(
     logger.info("Sweep triggered via HTTP")
     asyncio.create_task(scheduler.trigger_now())
     return {"ok": True}
+
+
+# ---------- Home fetcher (tools/home_fetcher) ----------
+#
+# A device on a connection Instagram trusts — the owner's phone or PC — polls
+# here for profile pages to fetch and posts Instagram's answer back. Pull, not
+# push: the home line is behind carrier-grade NAT and an unrooted phone can
+# neither forward a port nor run a Tailscale Funnel, so nothing dials in.
+
+def _check_home_token(token: Optional[str]) -> None:
+    expected = settings.home_fetch_token
+    if not expected:
+        raise HTTPException(
+            status_code=404, detail="home fetcher disabled (HOME_FETCH_TOKEN not set)"
+        )
+    if not token or not secrets.compare_digest(token, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing token"
+        )
+
+
+async def _send_alert(request: Request, text: str) -> None:
+    monitor = getattr(request.app.state, "monitor", None)
+    if monitor is None:
+        return
+    try:
+        await monitor.notifier.send_text(text)
+    except Exception as exc:  # pragma: no cover - never fail a poll on this
+        logger.warning("Home fetcher alert not sent: {}", exc)
+
+
+@router.get("/home-fetch/jobs")
+async def home_fetch_next_job(
+    request: Request,
+    wait: float = home_fetch.POLL_WAIT_MAX_SECONDS,
+    batch: int = 1,
+    x_watcher_token: Optional[str] = Header(default=None),
+    x_watcher_worker: Optional[str] = Header(default=None),
+    x_watcher_battery: Optional[str] = Header(default=None),
+    x_watcher_charging: Optional[str] = Header(default=None),
+    x_watcher_kinds: Optional[str] = Header(default=None),
+) -> dict:
+    """Long-poll for the next pages to fetch — up to `batch` of them (capped),
+    waiting only for the first. Answers {"job": null, "jobs": []} after
+    `wait` seconds (capped) when there is nothing to do; the worker asks
+    again at once. Each poll marks the worker as connected and, when the
+    device reports its battery, may raise the low-battery alert. `job` is
+    the first of `jobs`, kept for workers that take one at a time."""
+    _check_home_token(x_watcher_token)
+    battery: Optional[int] = None
+    if x_watcher_battery is not None:
+        try:
+            battery = max(0, min(100, int(x_watcher_battery)))
+        except ValueError:
+            battery = None
+    charging: Optional[bool] = None
+    if x_watcher_charging is not None:
+        charging = x_watcher_charging.strip().lower() in ("yes", "1", "true", "charging")
+    home_fetch.broker._worker = (x_watcher_worker or "unnamed")[:40]
+    alert = home_fetch.broker.note_device(
+        battery=battery, charging=charging,
+        threshold=settings.home_fetch_low_battery_percent,
+    )
+    if alert:
+        asyncio.create_task(_send_alert(request, alert))
+    kinds = None
+    if x_watcher_kinds:
+        kinds = [k.strip() for k in x_watcher_kinds.split(",") if k.strip()]
+    jobs = await home_fetch.broker.next_job(
+        wait=wait, worker=(x_watcher_worker or "unnamed")[:40],
+        max_jobs=batch, kinds=kinds,
+    )
+    handed = [
+        {"id": job.id, "username": job.username, "kind": job.kind, "user_id": job.user_id}
+        for job in jobs
+    ]
+    return {"job": handed[0] if handed else None, "jobs": handed}
+
+
+@router.post("/home-fetch/jobs/{job_id}")
+async def home_fetch_deliver(
+    job_id: str,
+    request: Request,
+    x_watcher_token: Optional[str] = Header(default=None),
+    x_ig_status: Optional[str] = Header(default=None),
+    x_ig_final_url: Optional[str] = Header(default=None),
+) -> dict:
+    """Instagram's answer for one job: its status in X-IG-Status, the HTML as
+    the body (gzip-compressed when Content-Encoding says so). {"ok": false}
+    means the check that asked has already given up — nothing to do."""
+    _check_home_token(x_watcher_token)
+    raw = await request.body()
+    if request.headers.get("content-encoding", "").lower() == "gzip":
+        try:
+            raw = gzip.decompress(raw)
+        except (OSError, EOFError):
+            raise HTTPException(status_code=400, detail="body is not valid gzip")
+    try:
+        ig_status = int(x_ig_status or 0)
+    except ValueError:
+        ig_status = 0
+    accepted = home_fetch.broker.deliver(
+        job_id,
+        home_fetch.PageResult(
+            status=ig_status,
+            body=raw.decode("utf-8", "replace"),
+            final_url=x_ig_final_url or "",
+        ),
+    )
+    return {"ok": accepted}
 
 
 @router.post(settings.telegram_webhook_path)

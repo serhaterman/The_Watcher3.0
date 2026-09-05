@@ -29,6 +29,7 @@ from app.bot import keyboards
 from app.config import settings
 from app.database import crud
 from app.database.session import get_session
+from app.monitor import home_fetch
 from app.monitor.analytics import compute_rhythm, render_rhythm
 from app.monitor.health import fetch_health, render_health_lines
 from app.monitor.service import MonitorService
@@ -541,6 +542,11 @@ async def _render_account_card(
         snapshot = await crud.get_latest_snapshot(
             session, account.id, successful_only=True
         )
+        # The newest reading that actually SAW the counts — for dating them
+        # when the newest row is an id-only one that carried them forward.
+        last_full = await crud.get_latest_snapshot_excluding_source(
+            session, account.id, exclude="id_probe"
+        )
         media = await crud.latest_media_hash(session, account.id)
         highlight_catalog = await crud.get_highlight_catalog(session, account.id)
         untracked_highlights = await crud.get_untracked_highlight_ids(
@@ -593,6 +599,19 @@ async def _render_account_card(
             lines.append(
                 "<i>Read from the public page (the API was blocked) — it "
                 "carries no post count, reels or highlights.</i>"
+            )
+        elif snapshot_source == "id_probe":
+            # An id-only reading knows the username and the picture; the
+            # numbers and the bio above are carried forward from the last
+            # reading that saw them — date them, so they can't read as now.
+            when = (
+                f" on {fmt_timestamp(last_full.created_at)}"
+                if last_full is not None else ""
+            )
+            lines.append(
+                "<i>Checked by Instagram ID only — Instagram is refusing "
+                "username lookups. Name, followers, bio and counts are from "
+                f"the last full reading{when}.</i>"
             )
         flags: list[str] = []
         if snapshot.is_private:
@@ -697,6 +716,8 @@ def instagram_route() -> str:
         # PROXY_URL wraps the whole session, so it applies to the hop that
         # reaches the worker — not to the worker's own egress to Instagram.
         route += " + outbound proxy"
+    if settings.home_fetch_token:
+        route += f" · home fetcher {home_fetch.broker.describe()}"
     return route
 
 
@@ -716,6 +737,28 @@ def _guards_line() -> str:
     else:
         anomaly = "anomaly off"
     return f"🛡 Guards: {breaker} · {anomaly}"
+
+
+async def _door_line(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """One line on the username API's door, only while a sweep's verdict that
+    it refuses every lookup still stands — the reason checks are quick and
+    counts come from the page rather than the API."""
+    monitor = context.application.bot_data.get("monitor")
+    if monitor is None or not hasattr(monitor, "username_api_known_closed"):
+        return ""
+    try:
+        closed = await monitor.username_api_known_closed()
+    except Exception:  # pragma: no cover - a status line must never fail /status
+        return ""
+    if not closed:
+        return ""
+    since = getattr(monitor, "username_api_closed_since", None)
+    when = f" since {fmt_timestamp(since)}" if since else ""
+    return (
+        f"🚪 Profile API: refusing username lookups{when} — knocked once per "
+        "sweep, skipped on manual checks; the ID route and the profile page "
+        "carry the checks\n"
+    )
 
 
 async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -777,6 +820,7 @@ async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
     health_lines = render_health_lines(fetch_health.snapshot())
     health_block = ("\n\n" + "\n".join(health_lines)) if health_lines else ""
 
+    door_line = await _door_line(context)
     return (
         "<b>📊 Watcher status</b>\n\n"
         f"Accounts: <b>{stats['accounts_total']}</b> "
@@ -793,6 +837,7 @@ async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"{dark_line}"
         f"{stakeout_line}\n"
         f"{_route_line()}\n"
+        f"{door_line}"
         f"{_guards_line()}"
         f"{health_block}"
     )
@@ -2507,9 +2552,47 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"❌ <b>API</b> (web_profile_info) — <code>"
             f"{esc(str(api.error or api.http_status))}</code>"
         )
+    await show("⏳ Asking by numeric ID…")
+
+    # The numeric-id route — the one that kept answering when the username
+    # routes went dark (2026-09-05). Needs the stored id; for an unmonitored
+    # username there is nothing to ask by.
+    async with get_session() as session:
+        monitored = await crud.get_account(session, username)
+        stored_id = monitored.instagram_id if monitored else None
+    probe = None
+    if stored_id:
+        probe = await service.instagram.probe_by_id(str(stored_id))
+        if probe.answered:
+            reel = probe.reel_data or {}
+            line = (
+                f"✅ <b>ID route</b> (graphql by id <code>{esc(str(stored_id))}</code>)"
+                f" — resolves to <b>@{esc(probe.username or '?')}</b>, "
+                f"story: {'yes' if reel.get('has_public_story') else 'no'}, "
+                f"highlights: {len(reel.get('highlights') or {})}"
+            )
+            if probe.username and probe.username != username.lower():
+                line += " — <b>renamed</b>; the next check follows the new name"
+            lines.append(line)
+        elif probe.gone:
+            lines.append(
+                "❌ <b>ID route</b> — Instagram says this ID no longer exists "
+                "(account deactivated or deleted)"
+            )
+        else:
+            lines.append(
+                f"❌ <b>ID route</b> — <code>HTTP {probe.status or 'no answer'}</code>"
+            )
+    else:
+        lines.append(
+            "➖ <b>ID route</b> — skipped: no Instagram ID stored for this account"
+        )
     await show("⏳ Trying the public page…")
 
-    page = await service.instagram.probe_public_page(username)
+    # A probe measures the door even while the client is skipping it.
+    page = await service.instagram.probe_public_page(
+        username, allow_home=False, force_direct=True
+    )
     got = page.get("parsed")
     if got:
         # A count Instagram omitted is shown as "—", never as 0: `all_media_count`
@@ -2520,7 +2603,8 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return fmt_number(value) if isinstance(value, int) else "—"
 
         lines.append(
-            f"✅ <b>Public page</b> — followers: <b>{count('followers_count')}</b>, "
+            f"✅ <b>Public page</b> (this host) — followers: "
+            f"<b>{count('followers_count')}</b>, "
             f"following: <b>{count('following_count')}</b>, "
             f"posts: <b>{count('posts_count')}</b>"
             + (" 🔒" if got.get("is_private") else "")
@@ -2529,9 +2613,32 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     else:
         lines.append(
-            f"❌ <b>Public page</b> — <code>{esc(str(page.get('error')))}</code> "
+            f"❌ <b>Public page</b> (this host) — "
+            f"<code>{esc(str(page.get('error')))}</code> "
             f"({fmt_number(page.get('bytes') or 0)} bytes)"
         )
+
+    # The same page, fetched by the home fetcher — a phone or PC on a
+    # connection Instagram trusts (tools/home_fetcher). Measured on its own so
+    # "the page is blocked" and "the phone is off" stay distinguishable.
+    if settings.home_fetch_token:
+        await show("⏳ Asking the home fetcher…")
+        home = await service.instagram.probe_home_page(username)
+        home_got = home.get("parsed")
+        if home_got:
+            def hcount(field: str) -> str:
+                value = home_got.get(field)
+                return fmt_number(value) if isinstance(value, int) else "—"
+            lines.append(
+                f"✅ <b>Home fetcher</b> — followers: <b>{hcount('followers_count')}</b>, "
+                f"following: <b>{hcount('following_count')}</b>"
+                + (" 🔒" if home_got.get("is_private") else "")
+            )
+            got = got or home_got
+        else:
+            lines.append(
+                f"❌ <b>Home fetcher</b> — <code>{esc(str(home.get('error')))}</code>"
+            )
     await show("⏳ Checking saveinsta…")
 
     if service.stories is not None:
@@ -2553,6 +2660,12 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(
             "<i>The API is blocked, but the page answers — profile stats keep "
             "arriving, minus the reel/highlight counts.</i>"
+        )
+    elif probe is not None and probe.answered:
+        lines.append(
+            "<i>The username routes are blocked, but the ID route answers — "
+            "username, picture and story status stay live; followers, bio "
+            "and counts don't.</i>"
         )
     elif service.stories is not None and any("✅ <b>saveinsta" in ln for ln in lines):
         lines.append(
@@ -2995,6 +3108,32 @@ async def _handle_menu(
 
     if action == "status":
         await _safe_answer(query)
+        text = await _render_status_message(context)
+        await _safe_edit_text(
+            query, text, reply_markup=keyboards.status_actions()
+        )
+        return
+
+    if action == "battery":
+        # The phone reports its battery with every poll, so this is always the
+        # latest reading — the button shows it as a popup and refreshes the
+        # status text (which carries the same reading on its home-fetcher line).
+        from app.monitor import home_fetch
+        broker = home_fetch.broker
+        if not settings.home_fetch_token:
+            popup = "The home fetcher is off (HOME_FETCH_TOKEN not set)."
+        elif broker.battery is None:
+            popup = f"No battery reading yet — home fetcher {broker.describe()}."
+        else:
+            charge = (
+                "charging" if broker.charging
+                else "not charging" if broker.charging is False else "unknown"
+            )
+            seen = broker.last_seen_seconds
+            ago = "just now" if seen is None or seen < 5 else f"{seen:.0f}s ago"
+            conn = "connected" if broker.connected else "NOT connected"
+            popup = f"🔋 {broker.battery}% ({charge})\n{conn}, last poll {ago}"
+        await _safe_answer(query, popup, show_alert=True)
         text = await _render_status_message(context)
         await _safe_edit_text(
             query, text, reply_markup=keyboards.status_actions()

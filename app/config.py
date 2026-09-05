@@ -53,9 +53,20 @@ class Settings(BaseSettings):
     # When unset, requests go out unauthenticated.
     ig_session_cookie: Optional[str] = Field(default=None, alias="IG_SESSION_COOKIE")
     ig_proxy_url: Optional[str] = Field(default=None, alias="IG_PROXY_URL")
+    # The home fetcher (tools/home_fetcher): a phone or PC on a connection
+    # Instagram trusts polls this bot for profile pages to fetch and posts them
+    # back — no tunnel, no inbound port. This is the shared secret it presents;
+    # set the same value on both sides. Empty = the door is off.
+    home_fetch_token: Optional[str] = Field(default=None, alias="HOME_FETCH_TOKEN")
+    # The worker reports its battery with every poll; at or below this percent
+    # while not charging, the owner gets one Telegram alert (and one more at
+    # half of it). 0 disables the alert.
+    home_fetch_low_battery_percent: int = Field(
+        default=20, alias="HOME_FETCH_LOW_BATTERY_PERCENT"
+    )
 
     # How many times a 401/403 from the Cloudflare Worker is re-asked. One
-    # worker call is already 8 upstream attempts with rotating UAs and hosts —
+    # worker call is already 6 upstream attempts with rotating UAs and hosts —
     # but it may also leave from a different Cloudflare colo, and Instagram's
     # datacenter gate answers differently per colo, so a re-ask is a real second
     # chance rather than a repeat of the same question.
@@ -69,6 +80,14 @@ class Settings(BaseSettings):
     # what shuts the gate.
     ig_sweep_auth_attempts: int = Field(default=1, alias="IG_SWEEP_AUTH_ATTEMPTS")
     ig_manual_auth_attempts: int = Field(default=3, alias="IG_MANUAL_AUTH_ATTEMPTS")
+    # How long a sweep's verdict that the username API refused every lookup is
+    # remembered. While it holds, the next sweep knocks on that API once (one
+    # account) instead of SWEEP_BREAKER_THRESHOLD times, and manual checks skip
+    # it altogether — the id route and the page doors still run. The API
+    # reopens the moment a knock answers 200.
+    username_api_recheck_seconds: int = Field(
+        default=43200, alias="USERNAME_API_RECHECK_SECONDS"
+    )
 
     # Scheduler
     check_interval: int = Field(default=1800, alias="CHECK_INTERVAL")
