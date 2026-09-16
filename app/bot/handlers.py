@@ -35,6 +35,7 @@ from app.monitor.health import fetch_health, render_health_lines
 from app.monitor.service import MonitorService
 from app.utils.formatting import esc, fmt_number, fmt_timestamp, truncate
 from app.utils.logger import logger
+from app.utils.tasks import spawn
 from app.workers.scheduler import (
     MAX_INTERVAL,
     MIN_INTERVAL,
@@ -761,6 +762,54 @@ async def _door_line(context: ContextTypes.DEFAULT_TYPE) -> str:
     )
 
 
+def _last_sweep_lines(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Which doors served the last sweep's readings.
+
+    This used to be sent as three extra lines after every sweep-complete
+    message — the same sentences every half hour, describing a standing
+    condition rather than an event. It is the sort of thing you want on hand,
+    not pushed at you, so it lives here.
+    """
+    monitor = context.application.bot_data.get("monitor")
+    last = getattr(monitor, "last_sweep", None) if monitor else None
+    if not last:
+        return ""
+    checked = last.get("checked") or 0
+    page_only = last.get("page_only") or 0
+    id_only = last.get("id_only") or 0
+    full = max(0, (last.get("answered") or 0) - page_only - id_only)
+    parts: list[str] = []
+    if full:
+        parts.append(f"<b>{full}</b> full")
+    if page_only:
+        parts.append(f"<b>{page_only}</b> from the profile page")
+    if id_only:
+        parts.append(f"<b>{id_only}</b> by Instagram ID only")
+    if last.get("failed"):
+        parts.append(f"<b>{last['failed']}</b> failed")
+    if last.get("deferred"):
+        parts.append(f"<b>{last['deferred']}</b> deferred")
+    if not parts:
+        return ""
+    line = f"\n📄 Last sweep: <b>{checked}</b> checked — " + ", ".join(parts)
+    if last.get("recovered"):
+        line += f" (<b>{last['recovered']}</b> recovered on retry)"
+    # What a partial reading does and does not know, said once rather than
+    # implied — the counts are live, the things the page cannot see are
+    # carried forward rather than invented.
+    if page_only:
+        line += (
+            "\n   ↳ page readings: followers, following, bio and privacy are "
+            "live; reel and highlight counts carried forward"
+        )
+    if id_only:
+        line += (
+            "\n   ↳ ID readings: username, picture and story status are live; "
+            "followers, bio and counts were not read and not guessed"
+        )
+    return line
+
+
 async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
     async with get_session() as session:
         stats = await crud.stats_summary(session)
@@ -833,6 +882,7 @@ async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"(±{settings.jitter_seconds}s jitter)\n"
         f"Last sweep: <b>{last_sweep_str}</b>\n"
         f"Next sweep: <b>{next_run_str}</b>"
+        f"{_last_sweep_lines(context)}"
         f"{digest_line}"
         f"{dark_line}"
         f"{stakeout_line}\n"
@@ -1149,7 +1199,7 @@ async def _do_add_bulk(
                 parse_mode=ParseMode.HTML,
             )
 
-    asyncio.create_task(_baseline())
+    spawn(_baseline(), name="bulk-add:baseline")
 
 
 async def _send_profile_photo(
@@ -1250,7 +1300,10 @@ async def _begin_stakeout(
     info = await sched.start_stakeout(account.id, username, duration=duration)
     service: MonitorService = context.application.bot_data["monitor"]
     # Immediate first check (don't wait one interval) — fire-and-forget.
-    asyncio.create_task(service.check_username(username, notify_unchanged=False))
+    spawn(
+        service.check_username(username, notify_unchanged=False),
+        name=f"stakeout:first-check:{username}",
+    )
     interval = info["interval"]
     end = info["end"]
     text = (
@@ -3115,24 +3168,48 @@ async def _handle_menu(
         return
 
     if action == "battery":
-        # The phone reports its battery with every poll, so this is always the
-        # latest reading — the button shows it as a popup and refreshes the
-        # status text (which carries the same reading on its home-fetcher line).
+        # Everything about the phone, on demand. This used to go out as its
+        # own message after every sweep, which on a healthy run said the
+        # phone did nothing — true, and not worth a notification. The phone
+        # reports its battery with every poll, so this is always the latest
+        # reading.
         from app.monitor import home_fetch
         broker = home_fetch.broker
         if not settings.home_fetch_token:
             popup = "The home fetcher is off (HOME_FETCH_TOKEN not set)."
-        elif broker.battery is None:
-            popup = f"No battery reading yet — home fetcher {broker.describe()}."
         else:
-            charge = (
-                "charging" if broker.charging
-                else "not charging" if broker.charging is False else "unknown"
-            )
+            name = broker.worker or "phone"
             seen = broker.last_seen_seconds
-            ago = "just now" if seen is None or seen < 5 else f"{seen:.0f}s ago"
-            conn = "connected" if broker.connected else "NOT connected"
-            popup = f"🔋 {broker.battery}% ({charge})\n{conn}, last poll {ago}"
+            if seen is None:
+                lines = [f"📱 {name}", "Never polled — the worker has not run."]
+            else:
+                ago = "just now" if seen < 5 else f"{seen:.0f}s ago"
+                conn = "connected" if broker.connected else "NOT connected"
+                lines = [f"📱 {name}", f"{conn}, last poll {ago}"]
+                if broker.battery is None:
+                    lines.append("🔋 no battery reading (this device doesn't say)")
+                else:
+                    charge = (
+                        "charging" if broker.charging
+                        else "not charging" if broker.charging is False
+                        else "power state unknown"
+                    )
+                    lines.append(f"🔋 {broker.battery}% ({charge})")
+                jobs = broker.last_sweep_jobs
+                if jobs is None:
+                    lines.append("No sweep has finished since the bot started.")
+                elif jobs == 0:
+                    lines.append(
+                        "0 answers in the last sweep — this host reached "
+                        "Instagram on its own, so the phone stood by."
+                    )
+                else:
+                    lines.append(
+                        f"{jobs} answer{'' if jobs == 1 else 's'} in the last sweep."
+                    )
+                if broker.pending:
+                    lines.append(f"{broker.pending} job(s) waiting right now.")
+            popup = "\n".join(lines)
         await _safe_answer(query, popup, show_alert=True)
         text = await _render_status_message(context)
         await _safe_edit_text(
@@ -3229,7 +3306,7 @@ async def _handle_menu(
             return
         alert = "Sweep started — also fetching missing Instagram IDs!" if backfill_ids else "Sweep started!"
         await _safe_answer(query, alert)
-        asyncio.create_task(sched.trigger_now(backfill_ids=backfill_ids))
+        spawn(sched.trigger_now(backfill_ids=backfill_ids), name="sweep:button")
         text = await _render_status_message(context)
         running_msg = "🔄 Sweep running"
         if backfill_ids:

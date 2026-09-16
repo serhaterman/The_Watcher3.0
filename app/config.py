@@ -58,11 +58,14 @@ class Settings(BaseSettings):
     # back — no tunnel, no inbound port. This is the shared secret it presents;
     # set the same value on both sides. Empty = the door is off.
     home_fetch_token: Optional[str] = Field(default=None, alias="HOME_FETCH_TOKEN")
-    # The worker reports its battery with every poll; at or below this percent
-    # while not charging, the owner gets one Telegram alert (and one more at
-    # half of it). 0 disables the alert.
-    home_fetch_low_battery_percent: int = Field(
-        default=20, alias="HOME_FETCH_LOW_BATTERY_PERCENT"
+    # The worker reports its battery with every poll. These are the rungs it
+    # is allowed to speak at, highest first: crossing one while NOT charging
+    # is one Telegram alert, and each rung fires at most once on the way
+    # down. Empty disables the alerts entirely — the reading is still shown
+    # on the phone button in /status, which is where it belongs when it is
+    # not urgent.
+    home_fetch_battery_alerts: str = Field(
+        default="50,20,10,5", alias="HOME_FETCH_BATTERY_ALERTS"
     )
 
     # How many times a 401/403 from the Cloudflare Worker is re-asked. One
@@ -88,6 +91,16 @@ class Settings(BaseSettings):
     username_api_recheck_seconds: int = Field(
         default=43200, alias="USERNAME_API_RECHECK_SECONDS"
     )
+    # How many refused username lookups in a row — with none answering — a
+    # sweep spends before concluding the API is shut, when no stored verdict
+    # says so already. This used to borrow SWEEP_BREAKER_THRESHOLD, which is
+    # the number for a far more drastic call (abandoning the sweep), and the
+    # two deserve different evidence. One knock is ~9 s and six blocked
+    # upstream attempts, so five of them is 45 s and thirty refused requests
+    # per rediscovery. Closing ONE door needs less: the fallback (the profile
+    # page and the id route) is proven, the door reopens the moment any knock
+    # answers 200, and it is re-tested every sweep regardless.
+    username_api_knocks: int = Field(default=2, alias="USERNAME_API_KNOCKS")
 
     # Scheduler
     check_interval: int = Field(default=1800, alias="CHECK_INTERVAL")
@@ -147,6 +160,21 @@ class Settings(BaseSettings):
     # instead of silently baselining it like a normal first public sighting. Set
     # to false to keep the old baseline-only behavior.
     auto_grab_on_public: bool = Field(default=True, alias="AUTO_GRAB_ON_PUBLIC")
+
+    # How often to LIST a public account's grid when the post count is not
+    # readable, so a new post is still found. The count is normally the cheap
+    # trigger — it rises, and only then is the grid listed — but the profile
+    # page never carries one (`all_media_count` is null on every capture), so
+    # while the username API is shut nothing ever rose and new posts stopped
+    # being delivered entirely, silently, from 2026-09-05.
+    #
+    # The listing itself is the detector when no count exists: one saveinsta
+    # round trip per PUBLIC account per interval, deduplicated against
+    # seen_stories exactly as the count-triggered path is. The default is one
+    # sweep, which restores the original responsiveness; raise it to trade
+    # promptness for third-party traffic if many accounts are public. 0
+    # disables the fallback (posts are then only found when a count rises).
+    post_scan_interval: int = Field(default=1800, alias="POST_SCAN_INTERVAL")
 
     # Highlight re-scan cadence (seconds). Listing every highlight reel's media
     # on every sweep is close to pure bandwidth: a reel's contents only change
@@ -209,6 +237,12 @@ class Settings(BaseSettings):
 
     # Logging
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    # The host's health checker hits /health every few seconds, and uvicorn
+    # logs an access line for each — twelve a minute of "still alive", which
+    # is enough to bury a sweep between two of them. Passing checks are hidden
+    # by default; a FAILING one always logs, whatever this says. Set true when
+    # the question is whether the health checker is running at all.
+    log_health_checks: bool = Field(default=False, alias="LOG_HEALTH_CHECKS")
 
     # Optional proxy (single URL applied to both http and https)
     proxy_url: Optional[str] = Field(default=None, alias="PROXY_URL")
@@ -237,6 +271,21 @@ class Settings(BaseSettings):
             return None
         cleaned = "".join(c for c in v if c.isalnum() or c in "_-")[:256]
         return cleaned or None
+
+    @property
+    def battery_alert_levels(self) -> List[int]:
+        """The battery rungs to alert on, highest first, de-duplicated and
+        clamped to 1-100. Anything unparseable is dropped rather than turning
+        a typo into silence at the level that mattered."""
+        out: List[int] = []
+        for chunk in self.home_fetch_battery_alerts.split(","):
+            chunk = chunk.strip()
+            if not chunk.isdigit():
+                continue
+            level = max(1, min(100, int(chunk)))
+            if level not in out:
+                out.append(level)
+        return sorted(out, reverse=True)
 
     @property
     def admin_ids(self) -> List[int]:

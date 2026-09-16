@@ -62,6 +62,16 @@ KIND_PAGE = "page"
 KIND_REEL = "reel"
 KINDS = (KIND_PAGE, KIND_REEL)
 
+# Instagram refuses the reel query from this home line (429, measured
+# 2026-09-07 on two sweeps running). That refusal is not free: the worker
+# reads it as "wait a few minutes" and stops fetching ANYTHING for a minute,
+# so a reel nobody can have costs the phone the page door it exists for —
+# and that is exactly what made a live page request time out at 30 s while
+# the phone sat in a soft block. After this many refusals in a row the reel
+# jobs stop for a cooldown; pages are never held back.
+REEL_REFUSALS_BEFORE_PAUSE = 2
+REEL_PAUSE_SECONDS = 1800.0
+
 
 @dataclass
 class PageJob:
@@ -127,6 +137,13 @@ class HomeFetchBroker:
         self.battery: Optional[int] = None
         self.charging: Optional[bool] = None
         self._battery_alerted_at: Optional[int] = None
+        # What the phone did for the last finished sweep. Kept rather than
+        # announced: on a healthy run this is 0 — the phone is a fallback and
+        # was not needed — which is good news, not a notification.
+        self.last_sweep_jobs: Optional[int] = None
+        # The reel route's standing with Instagram, from this home line.
+        self._reel_refusals = 0
+        self._reel_paused_until = 0.0
 
     # ----------------------------------------------------------- state
 
@@ -178,44 +195,66 @@ class HomeFetchBroker:
         ago = f"{seen:.0f}s" if minutes < 1 else f"{minutes:.0f} min"
         return f"not connected ({who} last polled {ago} ago{battery})"
 
+    def note_sweep(self, jobs: int) -> None:
+        """How many answers the phone delivered during the sweep that just
+        finished — read by the phone button in /status."""
+        self.last_sweep_jobs = max(0, jobs)
+
     def note_device(
         self,
         *,
         battery: Optional[int],
         charging: Optional[bool],
-        threshold: int,
+        levels: Iterable[int],
     ) -> Optional[str]:
         """Record the worker's battery reading; return an alert to send when
-        it crossed a line, else None.
+        it crossed a rung, else None.
 
-        One alert when the level is at or below `threshold` while not
-        charging, one more at half the threshold, then silence until the
-        phone is charging again (which is announced, since the owner was
-        told to worry) or has climbed well clear of the threshold.
-        `threshold` 0 disables the alerts; the reading is still shown.
+        `levels` is the ladder to speak at, e.g. 50/20/10/5. Falling to or
+        below a rung while NOT charging is one message, and each rung fires
+        at most once per discharge — so a phone sitting at 19% for six hours
+        says nothing more after the 20% alert, and only reaching 10% speaks
+        again. Plugging it back in is announced once (the owner was told to
+        worry), and that also re-arms every rung above the current level, so
+        the next discharge alerts properly. An empty ladder disables the
+        alerts; the reading is still recorded for the phone button.
         """
         self.battery, self.charging = battery, charging
-        if battery is None or threshold <= 0:
+        # Ascending, so the search below finds the DEEPEST rung this reading
+        # has reached rather than the highest one it is still under — the
+        # difference between 20% speaking at 20% and 20% re-reporting 50%.
+        rungs = sorted({int(v) for v in levels})
+        if battery is None or not rungs:
             return None
         who = f"the home fetcher ({self._worker})" if self._worker else "the home fetcher"
-        if charging or battery > threshold + 10:
+
+        if charging:
             was_alerted = self._battery_alerted_at is not None
             self._battery_alerted_at = None
-            if was_alerted and charging:
-                return f"🔌 <b>{who}</b> is charging again ({battery}%)."
-            return None
-        if battery > threshold or charging is None:
-            return None
-        second_line = max(1, threshold // 2)
-        if self._battery_alerted_at is None or (
-            battery <= second_line and self._battery_alerted_at > second_line
-        ):
-            self._battery_alerted_at = battery
             return (
-                f"🔋 <b>{who}</b> is at <b>{battery}%</b> and not charging — "
-                "plug it in, or the profile-page door closes when it dies."
+                f"🔌 <b>{who}</b> is charging again ({battery}%)."
+                if was_alerted else None
             )
-        return None
+        if charging is None:
+            # The device does not say whether it is on power. Never guess it
+            # is running down — that is a false alarm every poll on a PC.
+            return None
+
+        # The lowest rung this reading has reached. Alert only when it is a
+        # rung we have not already spoken at during this discharge.
+        crossed = next((r for r in rungs if battery <= r), None)
+        if crossed is None:
+            # Comfortably above the whole ladder — a fresh discharge from
+            # here should alert again at every rung.
+            self._battery_alerted_at = None
+            return None
+        if self._battery_alerted_at is not None and crossed >= self._battery_alerted_at:
+            return None
+        self._battery_alerted_at = crossed
+        return (
+            f"🔋 <b>{who}</b> is at <b>{battery}%</b> and not charging — "
+            "plug it in, or the profile-page door closes when it dies."
+        )
 
     # ------------------------------------------------------ the bot side
 
@@ -234,10 +273,17 @@ class HomeFetchBroker:
         the sweep will find that out per check, quickly, as before."""
         return self._prefetch([(KIND_PAGE, u, u) for u in usernames])
 
+    @property
+    def reel_route_paused(self) -> bool:
+        """True while Instagram is refusing the reel query from this home
+        line often enough that asking again costs more than it returns."""
+        return time.monotonic() < self._reel_paused_until
+
     def prefetch_reels(self, users: Iterable[tuple[str, str]]) -> int:
         """Queue reel queries for a whole sweep: `users` is (numeric id,
-        username) pairs. Only when the connected worker can fetch reels."""
-        if KIND_REEL not in self._worker_kinds:
+        username) pairs. Only when the connected worker can fetch reels, and
+        only while Instagram is still answering them from here."""
+        if KIND_REEL not in self._worker_kinds or self.reel_route_paused:
             return 0
         return self._prefetch([(KIND_REEL, str(uid), name) for uid, name in users])
 
@@ -256,7 +302,7 @@ class HomeFetchBroker:
     ) -> Optional[PageResult]:
         """The reel query for `user_id`, from the phone — see request_page.
         None at once when the connected worker cannot fetch reels."""
-        if KIND_REEL not in self._worker_kinds:
+        if KIND_REEL not in self._worker_kinds or self.reel_route_paused:
             return None
         return await self._request(
             (KIND_REEL, str(user_id)), username or str(user_id), timeout, fresh
@@ -335,6 +381,8 @@ class HomeFetchBroker:
             self._by_key.pop(key, None)
         self._results[key] = result
         self.delivered += 1
+        if job.kind == KIND_REEL:
+            self._note_reel_answer(int(result.status or 0))
         now = time.monotonic()
         pickup = (job.handed - job.created) if job.handed else 0.0
         deliver_seconds = (now - job.handed) if job.handed else (now - job.created)
@@ -351,6 +399,27 @@ class HomeFetchBroker:
         return True
 
     # ---------------------------------------------------------- internal
+
+    def _note_reel_answer(self, status: int) -> None:
+        """Book what Instagram told the phone about a reel. A 200 clears the
+        record; refusals in a row stop the reel jobs for a while, because
+        each one also stops the phone fetching pages for a minute."""
+        if status == 200:
+            self._reel_refusals = 0
+            self._reel_paused_until = 0.0
+            return
+        self._reel_refusals += 1
+        if (
+            self._reel_refusals >= REEL_REFUSALS_BEFORE_PAUSE
+            and not self.reel_route_paused
+        ):
+            self._reel_paused_until = time.monotonic() + REEL_PAUSE_SECONDS
+            logger.info(
+                "Instagram refused the home fetcher's reel query {} times in "
+                "a row (last HTTP {}) — no more reel jobs for {:.0f} min, so "
+                "the phone stays free for pages",
+                self._reel_refusals, status, REEL_PAUSE_SECONDS / 60,
+            )
 
     def _cached(self, key: tuple[str, str]) -> Optional[PageResult]:
         result = self._results.get(key)
@@ -444,6 +513,14 @@ class HomeFetchBroker:
             self._loop = loop
             self._jobs.clear()
             self._by_key.clear()
+            # The waiters and the answers go with them. A waiter is a future
+            # belonging to the dead loop — nothing can ever resolve it, and
+            # resolving it from THIS loop would be a cross-loop call — while a
+            # kept answer is the reply to a question nobody is asking any
+            # more. Leaving either behind meant the state a "fresh" loop
+            # started from was not fresh.
+            self._waiters.clear()
+            self._results.clear()
         return self._queue
 
 

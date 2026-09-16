@@ -426,6 +426,10 @@ class InstagramClient:
     # long, and the most one attempt may take (redirect to the login page
     # included) before it counts as a refusal.
     _DIRECT_PAGE_BREAKER_FAILURES = 3
+    # Refusals in a row before a sweep decides the phone should take over the
+    # pages. Below the breaker (the door is still tried), above one (a single
+    # login-walled page is not a shut door).
+    _DIRECT_PAGE_HANDOVER_FAILURES = 2
     _DIRECT_PAGE_COOLDOWN = 1800.0
     _DIRECT_PAGE_TIMEOUT = 12.0
     # The Worker's reel route: refusals in a row before the phone is asked
@@ -442,6 +446,13 @@ class InstagramClient:
     # same user's reel data several times within seconds; 90s also covers a
     # quick card-open -> button-press sequence without re-fetching.
     _REEL_CACHE_TTL = 90.0
+    # The oldest home-fetched reel answer `reel_in_hand` will read. It has to
+    # span one sweep — the phone delivers the reels after the pages, and the
+    # story phase runs after the checks and the retry rounds — without ever
+    # reaching back into the previous one, whose story/live status is not this
+    # check's answer. Well under the broker's own 900s result TTL for exactly
+    # that reason.
+    _REEL_IN_HAND_MAX_AGE = 300.0
 
     async def fetch_reel_user(self, user_id: str) -> Optional[dict[str, Any]]:
         """Fetch reel/highlight metadata for a user id (graphql query_id=9957820854288654).
@@ -590,6 +601,44 @@ class InstagramClient:
                 if not probe.username and isinstance(raw_name, str) and raw_name.strip():
                     probe.username = raw_name.strip().lstrip("@").lower()
         return probe
+
+    def reel_in_hand(self, user_id: str) -> Optional[dict[str, Any]]:
+        """Reel data already paid for — never a request, never a wait.
+
+        This client's short cache, or an answer the home fetcher has since
+        delivered. A sweep asks the phone for its reels up front but checks
+        the accounts before the answers land (pages are handed out first, so
+        the counts arrive first); by the time the story phase runs they are
+        here, and reading them costs nothing. None means nothing is in hand.
+
+        Bounded by _REEL_IN_HAND_MAX_AGE, which is shorter than the broker's
+        own result TTL on purpose: this feeds a status the bot announces as
+        current, so an answer from the PREVIOUS sweep must not be dressed up
+        as this one's. Too old is the same as nothing in hand, and the caller
+        falls back to what the page said.
+        """
+        if not user_id:
+            return None
+        user_id = str(user_id)
+        cached = self._cached_reel(user_id)
+        if cached is not None:
+            return cached
+        if not settings.home_fetch_token:
+            return None
+        delivered = home_fetch.broker.cached_reel(user_id)
+        if delivered is None:
+            return None
+        if time.monotonic() - delivered.fetched_at > self._REEL_IN_HAND_MAX_AGE:
+            return None
+        status, parsed = self._parse_home_reel(delivered)
+        if status != 200 or parsed is None:
+            return None
+        if len(self._reel_cache) > 512:  # bound memory across many targets
+            self._reel_cache.clear()
+        self._reel_cache[user_id] = (
+            time.monotonic() + self._REEL_CACHE_TTL, parsed
+        )
+        return parsed
 
     def _cached_reel(self, user_id: str) -> Optional[dict[str, Any]]:
         cached = self._reel_cache.get(user_id)
@@ -998,15 +1047,42 @@ class InstagramClient:
     ) -> dict[str, Any]:
         """Fetch the public page and report what came back, in detail.
 
-        Returns {"status", "bytes", "parsed", "error", "door"}. Two doors, in
-        order: this host's own request, then — when `HOME_FETCH_TOKEN` is set
-        and `allow_home` — the home fetcher, a device whose connection
-        Instagram trusts (see tools/home_fetcher). Every outcome is logged: this
+        Returns {"status", "bytes", "parsed", "error", "door"}. Two doors:
+        this host's own request, and — when `HOME_FETCH_TOKEN` is set and
+        `allow_home` — the home fetcher, a device whose connection Instagram
+        trusts (see tools/home_fetcher). The home door goes FIRST when its
+        answer is already in hand (`cached_page_ok`, i.e. a sweep that
+        prefetched it): a page already paid for beats a fresh refusal from a
+        datacenter IP. Otherwise this host asks first and the home fetcher is
+        the fallback. Every outcome is logged: this
         path only runs when the API is already blocked, so it is rare, and it
         is the one measurement that says whether anything can still reach
         Instagram. Learning that from a log needs the log to contain it.
         """
         timings: dict[str, float] = {}
+        # The answer may already be here. A sweep hands the phone its whole
+        # list up front, so by the time this account is checked its page is
+        # usually sitting in the broker — free, in memory, no wait. Taking it
+        # BEFORE this host's own door is what the prefetch is for: the direct
+        # door is refused from a datacenter IP and costs up to
+        # _DIRECT_PAGE_TIMEOUT seconds a go (three of those per cooldown
+        # window, on every sweep), and each attempt is one more refused
+        # request from an IP that is already out of favour.
+        if (
+            cached_page_ok
+            and allow_home
+            and not force_direct
+            and settings.home_fetch_token
+            and home_fetch.broker.cached(username) is not None
+        ):
+            clock = time.monotonic()
+            in_hand = await self.probe_home_page(username, cached_ok=True)
+            timings["home"] = time.monotonic() - clock
+            in_hand["timings"] = timings
+            if in_hand.get("parsed") is not None or in_hand.get("status") == 404:
+                return in_hand
+            # The delivered page carried nothing usable (a 429, a login wall).
+            # Fall through and try the doors below, as before.
         if not force_direct and time.monotonic() < self._direct_page_blocked_until:
             # Refused a few times in a row lately: don't spend up to
             # _DIRECT_PAGE_TIMEOUT seconds per account re-learning it. One
@@ -1037,6 +1113,32 @@ class InstagramClient:
         # home fetcher's alongside it.
         result["home_error"] = home.get("error")
         return result
+
+    @property
+    def direct_page_door_failing(self) -> bool:
+        """True when this host's own page door did not answer last time it
+        was asked — the moment the home fetcher stops being insurance and
+        starts being the route.
+
+        Two refusals in a row, not one. A single page can come back as a
+        login wall while the door itself is perfectly healthy — measured
+        2026-09-07, one account out of seventeen, with the other sixteen
+        answering in half a second each. On the first-refusal rule that one
+        page handed the phone the fifteen accounts still to check; it fetched
+        all fifteen, delivered them 80 seconds after the sweep had already
+        finished reading every one of them from here, and spent fifteen
+        Instagram requests from the home line to do it. One odd page is not a
+        shut door.
+
+        Still well short of the breaker's third strike, because being late
+        costs those accounts the full direct timeout plus a live wait on the
+        phone each. False at boot, so a host Instagram is currently serving
+        asks for nothing from home.
+        """
+        return (
+            self._direct_page_failures >= self._DIRECT_PAGE_HANDOVER_FAILURES
+            or time.monotonic() < self._direct_page_blocked_until
+        )
 
     def _note_direct_page(self, outcome: dict[str, Any]) -> None:
         """Book this host's page door: an answer with the payload resets the

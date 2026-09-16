@@ -63,6 +63,26 @@ _DOWNLOAD_UNAVAILABLE_MSG = (
 # concurrency of 1 the sweep produces the same request rhythm as a human
 # pressing Recheck — the pattern Instagram answers reliably.
 _SWEEP_STAGGER_SECONDS = 2.0
+# The most accounts one sweep may spend a live reel call on purely to refresh
+# a stale highlight catalog. Each is ~9 s when the Worker's colo refuses, and
+# it runs after every check, so this is the ceiling on a cost the sweep's
+# readings never wait for.
+_CATALOG_REFRESH_PER_SWEEP = 3
+# How many times one story/post item may fail to download before it is retired
+# as undownloadable. Counted in memory, so a restart is a fresh start — which
+# is the right side to err on: a story lives 24 hours and sweeps are half an
+# hour apart, so a transient source failure has room to recover, while an item
+# that is genuinely broken still stops being asked for.
+_DOWNLOAD_ATTEMPTS = 3
+# The smallest gap between an OFF-SCHEDULE check (a stakeout tick, a card
+# Recheck, /story) and whatever check ran last, sweep checks included. The
+# sweep paces itself through _SweepThrottle, but that throttle only knows
+# about its own sweep — so a stakeout ticking every two minutes fired
+# unpaced requests straight into the middle of a paced sweep, and the guard
+# that exists to prevent bursts could not see them. Deliberately shorter than
+# _SWEEP_STAGGER_SECONDS: this is one account with someone waiting on it, and
+# the job is to stop two requests landing together, not to slow the answer.
+_OFF_SCHEDULE_MIN_GAP_SECONDS = 1.0
 # First cooldown before re-checking accounts that hit a rate-limit block during
 # the sweep; it doubles each round up to the max. Instagram's anonymous throttle
 # windows are short, so a paced retry usually goes straight through.
@@ -97,6 +117,18 @@ _PUBLIC_GRAB_MAX_ATTEMPTS = 3
 # How many feed posts/reels one backlog grab lists — the same window the
 # on-demand download-all panel uses.
 _PUBLIC_GRAB_POST_LIMIT = 100
+
+
+def _humanize_seconds(seconds: float) -> str:
+    """A duration a person can read at a glance. `0.0h` is how a 90-second
+    setting managed to look like a rounding error in a log line instead of
+    the reason every sweep was re-paying its discovery."""
+    seconds = max(0.0, float(seconds))
+    if seconds < 120:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.1f}h"
 
 
 def _parse_utc(raw: Optional[str]) -> Optional[datetime]:
@@ -166,10 +198,10 @@ class _SweepThrottle:
             breaker_threshold if username_door_threshold is None
             else username_door_threshold
         )
-        # Sweep-wide bookkeeping the per-account check needs: the whole list
-        # (so the first refusal can hand it to the home fetcher up front), and
-        # two once-per-sweep latches.
-        self.sweep_usernames: list[str] = []
+        # Sweep-wide bookkeeping the per-account check needs: the accounts
+        # still to come (so a refusal can hand the REST to the home fetcher,
+        # not the ones already checked), and two once-per-sweep latches.
+        self.pending_usernames: list[str] = []
         self.pages_prefetched = False
         self.door_recorded = False
         self._cooldown = max(0.0, cooldown)  # 0 = open immediately, never pause
@@ -257,6 +289,14 @@ class _SweepThrottle:
 
     def note_skip(self) -> None:
         self._skipped += 1
+
+    def note_started(self, username: str) -> None:
+        """This account is being checked now, so it is no longer one the
+        home fetcher could usefully be asked for up front."""
+        try:
+            self.pending_usernames.remove(username)
+        except ValueError:
+            pass
 
     def record(
         self,
@@ -369,21 +409,32 @@ class _SweepThrottle:
         check (and for any rate-limit cooldown still running), and stamps the
         next gap on the way out so the spacing is measured between requests,
         not launches.
+
+        The departure time is CLAIMED under the lock, not just read: with more
+        than one lane, every waiting check used to read the same `_next_slot`,
+        sleep to it, and then leave together — a burst, which is the one shape
+        this class exists to prevent. Claiming it holds lane two back by the
+        stagger. With a single lane nothing changes: the check outlasts its own
+        claim, so the release stamp below is the one that lands — and it is the
+        one that carries the noise, so the rhythm still never looks metronomic.
         """
         async with self._gate:
             async with self._lock:
                 now = time.monotonic()
-                wait = max(0.0, self._next_slot - now, self._pause_until - now)
+                depart = max(now, self._next_slot, self._pause_until)
+                self._next_slot = depart + self.current_stagger
+            wait = depart - now
             if wait > 0:
                 await asyncio.sleep(wait)
             try:
                 yield
             finally:
                 async with self._lock:
-                    self._next_slot = (
+                    self._next_slot = max(
+                        self._next_slot,
                         time.monotonic()
                         + self.current_stagger
-                        + random.uniform(0.0, 0.8)
+                        + random.uniform(0.0, 0.8),
                     )
 
 
@@ -402,11 +453,32 @@ class MonitorService:
         self.notifier = notifier
         self.stories = stories
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_fetches)
+        # The story phase gets its own budget rather than sharing the one
+        # above. One semaphore was standing in for two different upstreams:
+        # a CHECK talks to Instagram, while the story phase talks to
+        # saveinsta and Telegram and holds its lane for the whole of a long
+        # body — listings, downloads, sends, database work. Sharing meant a
+        # card Recheck queued behind three accounts' media work for no
+        # reason, and it never bounded Instagram traffic any better, because
+        # the story phase barely touches Instagram. Same size, so neither
+        # side fans out wider than before.
+        self._story_semaphore = asyncio.Semaphore(settings.max_concurrent_fetches)
         # When a sweep last found the username API refusing every lookup
         # (None = it was answering). Loaded from app_settings on first use so
         # the memory survives a restart; see username_api_known_closed().
         self._username_api_closed_at: Optional[datetime] = None
         self._username_api_door_loaded = False
+        # The last finished sweep's shape — counts and which doors served it.
+        # Read by /status; None until a sweep has finished this process.
+        self.last_sweep: Optional[dict] = None
+        # (account_id, item pk) -> consecutive failed downloads. See
+        # _DOWNLOAD_ATTEMPTS.
+        self._download_failures: dict[tuple[Optional[int], str], int] = {}
+        # When the last check of ANY kind finished, and the gate that keeps an
+        # off-schedule check from landing on top of one. See
+        # _OFF_SCHEDULE_MIN_GAP_SECONDS.
+        self._last_check_at: float = 0.0
+        self._off_schedule_gate = asyncio.Lock()
         # account_id -> forum topic (message_thread_id). Resolved lazily and
         # cached so each account's alerts land in its own thread.
         self._topic_cache: dict[int, int] = {}
@@ -585,6 +657,46 @@ class MonitorService:
         age = datetime.now(timezone.utc) - closed_at
         return age < timedelta(seconds=max(0, settings.username_api_recheck_seconds))
 
+    def _door_open_reason(self) -> str:
+        """Why this sweep is about to knock on the username API instead of
+        trusting a stored verdict. Call only after `username_api_known_closed`
+        has run, so the verdict is loaded."""
+        at = self._username_api_closed_at
+        if at is None:
+            return (
+                "nothing recorded — either no sweep has found it shut yet, or "
+                "the last one got an answer out of it"
+            )
+        window = max(0, settings.username_api_recheck_seconds)
+        if window == 0:
+            return (
+                f"a verdict IS stored (shut at {at.isoformat()}) but "
+                "USERNAME_API_RECHECK_SECONDS is 0, so it is never trusted — "
+                "set it to e.g. 43200 to stop re-paying this discovery every "
+                "sweep"
+            )
+        age = (datetime.now(timezone.utc) - at).total_seconds()
+        reason = (
+            f"the stored verdict (shut at {at.isoformat()}) is "
+            f"{_humanize_seconds(age)} old, past the "
+            f"{_humanize_seconds(window)} recheck window"
+        )
+        # A window shorter than the gap between sweeps can never be used: the
+        # verdict is always stale by the time the next sweep reads it, so
+        # every sweep re-pays the discovery in full. That is not a tuning
+        # choice, it is the setting cancelling itself out, and the log is
+        # where someone would look to find out why.
+        interval = max(0, settings.check_interval)
+        if interval and window < interval:
+            reason += (
+                f" — and that window is SHORTER than the sweep interval "
+                f"({_humanize_seconds(interval)}), so the verdict expires "
+                "before any sweep can ever use it and each one pays the "
+                "knocks again; raise USERNAME_API_RECHECK_SECONDS well above "
+                "the interval (43200 = 12h)"
+            )
+        return reason
+
     async def _remember_username_api_door(
         self, *, closed: bool, answered: bool
     ) -> None:
@@ -600,6 +712,15 @@ class MonitorService:
                     await crud.set_setting(
                         session, _USERNAME_API_DOOR_KEY, now.isoformat()
                     )
+                # Said out loud, because the whole point of the verdict is
+                # that the NEXT sweep does not pay to rediscover this. A log
+                # that shows this line and then still says "believed open"
+                # next sweep names the problem as the window, not the write.
+                logger.info(
+                    "Username API door: recorded as shut at {} — the next "
+                    "sweep knocks once instead of {}",
+                    now.isoformat(), max(1, settings.username_api_knocks),
+                )
                 return
             if answered and self._username_api_closed_at is not None:
                 self._username_api_closed_at = None
@@ -797,6 +918,14 @@ class MonitorService:
         async with get_session() as session:
             accounts = await crud.list_accounts(session, only_active=True)
             targets = [(a.id, a.username) for a in accounts]
+            # Two batched reads, so the reel decision below — and the story
+            # phase's fallback further down — cost no per-account query.
+            highlight_stamps = await crud.get_settings_by_prefix(
+                session, "highlight_scan:"
+            )
+            last_privacy = await crud.latest_privacy_by_account(
+                session, [a.id for a in accounts]
+            )
 
         if not targets:
             logger.info("No active accounts to check.")
@@ -819,52 +948,122 @@ class MonitorService:
         # a threshold's worth of blocked Worker calls.
         known_closed = await self.username_api_known_closed()
         home_serving = bool(settings.home_fetch_token and home_fetch.broker.connected)
+        knocks = 1 if known_closed else max(1, settings.username_api_knocks)
         if known_closed:
             logger.info(
                 "Username API door: known shut since {} — one knock this sweep",
                 self._username_api_closed_at,
             )
         else:
+            # WHY it is believed open matters, and used to be unsayable: a
+            # sweep that rediscovers a shut door pays `knocks` blocked Worker
+            # calls at ~9 s and 6 upstream attempts each, and the log gave no
+            # way to tell "nothing recorded yet" from "recorded, then not
+            # trusted". A sweep that keeps paying it is a misconfiguration
+            # the logs should name, not a mystery.
             logger.info(
-                "Username API door: believed open — up to {} knocks before it "
-                "closes", settings.sweep_breaker_threshold,
+                "Username API door: believed open ({}) — up to {} knock(s) "
+                "before it closes", self._door_open_reason(), knocks,
             )
-        # With the API door shut and the phone serving, the bot makes no direct
-        # Instagram calls on the hot path — the id probe reads the phone's
-        # cache and the page comes from the phone — so there is nothing to pace
-        # against. The gap between checks drops to almost nothing and the sweep
-        # runs as fast as the phone can deliver, instead of adding 2 s of dead
-        # air per account.
-        base_stagger = 0.2 if (known_closed and home_serving) else _SWEEP_STAGGER_SECONDS
+        # Is the PHONE serving this sweep's pages, or is this host?
+        #
+        # It decides the pace, and getting it wrong is how the door gets shut.
+        # When the phone serves, the bot makes no direct Instagram calls on
+        # the hot path — the id probe reads the phone's cache and the page
+        # comes from the phone — so there is nothing to pace against and the
+        # gap drops to almost nothing. When THIS HOST serves (which it does
+        # again — Instagram started answering Render's own page requests,
+        # measured 2026-09-07), that same gap would fire one real Instagram
+        # request every 0.2 s: seventeen of them in twelve seconds, from a
+        # datacenter IP, which is precisely the burst that earns the 429 the
+        # phone exists to work around. So the fast pace is tied to the phone
+        # actually being the page source, not merely to it being connected.
+        phone_serves_pages = (
+            known_closed and home_serving and self.instagram.direct_page_door_failing
+        )
+        base_stagger = 0.2 if phone_serves_pages else _SWEEP_STAGGER_SECONDS
         throttle = _SweepThrottle(
             base_stagger=base_stagger,
             max_stagger=settings.sweep_stagger_max_seconds,
             breaker_threshold=settings.sweep_breaker_threshold,
             concurrency=settings.sweep_concurrency,
             cooldown=settings.sweep_breaker_cooldown_seconds,
-            username_door_threshold=1 if known_closed else None,
+            username_door_threshold=knocks,
         )
-        throttle.sweep_usernames = [uname for _, uname in targets]
+        throttle.pending_usernames = [uname for _, uname in targets]
         home_pages_before = home_fetch.broker.delivered
-        # Reel data for every account with a stored id, from the phone,
-        # before the first check. The Worker's reel route is refused per colo
-        # and each refusal costs ~9 s; the phone answers in one, and the
-        # probe finds the answer already in hand.
+        # Reel data from the phone, before the first check. The Worker's reel
+        # route is refused per colo and each refusal costs ~9 s; the phone
+        # answers in one, and the probe finds the answer already in hand.
+        #
+        # WHICH accounts, though, depends on what the reel is still needed
+        # for. With the username API shut and the phone serving pages, the
+        # page already answers the story question — so the reel adds only the
+        # live flag and the highlight catalog, and the catalog is re-listed at
+        # most once per HIGHLIGHT_SCAN_INTERVAL. Asking for one per account
+        # per sweep was a second Instagram request per account, on the very
+        # home line the page door depends on, for an answer nothing read.
+        # Now it goes out for the accounts whose catalog is actually due, and
+        # the story phase reads what comes back (`reel_in_hand`).
+        #
+        # A PRIVATE account is left out entirely. It has no story, no live
+        # broadcast and no visible highlights, so the story phase skips it and
+        # its scan stamp never advances — which made it read as permanently
+        # "due" and buy a reel query every sweep, forever, for nothing. The
+        # page still carries everything a private account's check reads: its
+        # counts, its handle (so a rename is caught) and its avatar. Only a
+        # privacy flag actually SEEN in the last successful reading counts —
+        # unknown means ask, so a new target is never silently skipped, and a
+        # private account going public is announced by the page and picked up
+        # from the next sweep.
         ids_by_name = {a.username: a.instagram_id for a in accounts}
-        self._prefetch_reels([
+        catalog_only = known_closed and home_serving
+        reel_targets = [
             (str(ids_by_name[uname]), uname)
-            for _, uname in targets if ids_by_name.get(uname)
-        ])
-        if known_closed:
-            # Every account will need its page: hand the phone the whole list
-            # now, so its round trips overlap the sweep instead of gating
-            # each check. (When the verdict is not yet known, the first
-            # refusal does the same — see _staggered_check.)
+            for aid, uname in targets
+            if ids_by_name.get(uname)
+            and (
+                not catalog_only
+                or (
+                    last_privacy.get(aid) is not True
+                    and self._highlight_scan_overdue(aid, highlight_stamps)
+                )
+            )
+        ]
+        if catalog_only:
+            private = sum(1 for aid, _ in targets if last_privacy.get(aid) is True)
+            logger.info(
+                "Reel queries this sweep: {} of {} account(s) — the page "
+                "answers the story question for the rest ({} private, which "
+                "have no reel to read)",
+                len(reel_targets), len(targets), private,
+            )
+        self._prefetch_reels(reel_targets)
+        if phone_serves_pages:
+            # Every account will need its page and this host cannot get one:
+            # hand the phone the whole list now, so its round trips overlap
+            # the sweep instead of gating each check. (When this host's door
+            # is still answering, nothing is handed over — the phone is
+            # insurance, and 17 fetches it never gets asked for are 17
+            # requests spent against the home line's own good standing. If
+            # the door fails mid-sweep the first refusal hands the rest over
+            # — see _staggered_check.)
             throttle.pages_prefetched = True
-            self._prefetch_pages(throttle.sweep_usernames)
+            self._prefetch_pages(throttle.pending_usernames)
+        elif known_closed:
+            logger.info(
+                "This host's page door is answering — the home fetcher stands "
+                "by rather than fetching {} page(s) nobody would read",
+                len(targets),
+            )
         results = await asyncio.gather(
             *(
-                self._staggered_check(throttle, aid, uname)
+                self._staggered_check(
+                    throttle, aid, uname,
+                    instagram_id=(
+                        str(ids_by_name[uname]) if ids_by_name.get(uname) else None
+                    ),
+                )
                 for aid, uname in targets
             ),
             return_exceptions=True,
@@ -875,10 +1074,18 @@ class MonitorService:
                 "{} account(s) deferred to the retry pass / next sweep",
                 throttle.peak_consecutive_blocks, throttle.skipped,
             )
-        await self._remember_username_api_door(
-            closed=throttle.username_door_closed,
-            answered=throttle.username_door_answered,
-        )
+        # Only when the mid-sweep latch has not already written this exact
+        # verdict. It writes the moment the door closes (so a restart cannot
+        # forget it), and repeating it here wrote the same row and logged the
+        # same line a second time every sweep. A door that closed can never
+        # go on to answer — closing requires that nothing answered, and from
+        # then on the API is not asked at all — so `door_recorded` means the
+        # verdict below is the one already stored.
+        if not throttle.door_recorded:
+            await self._remember_username_api_door(
+                closed=throttle.username_door_closed,
+                answered=throttle.username_door_answered,
+            )
 
         # account_id -> (fallback username, result dict). Exceptions become
         # failure dicts (flagged "crashed") so the retry pass can rewrite any
@@ -933,10 +1140,19 @@ class MonitorService:
             # A successful check already knows privacy and the numeric id —
             # only fall back to the two-query DB lookup when the result
             # doesn't (failed fetches), instead of paying it for every
-            # account on every sweep.
+            # account on every sweep. And before that lookup, what the sweep
+            # already read up front: a blocked sweep fails EVERY check, which
+            # is exactly when N more round trips are least affordable.
             is_private = r.get("is_private")
             instagram_id = r.get("instagram_id")
+            if is_private is None and target_account_id in last_privacy:
+                is_private = last_privacy[target_account_id]
+            if not instagram_id:
+                instagram_id = ids_by_name.get(uname)
             if is_private is None or not instagram_id:
+                # Still unanswered: the account has no successful snapshot, or
+                # its id was only recovered from one mid-check and is not in
+                # the list this sweep started from.
                 meta = await self._load_account_story_meta(target_account_id)
                 if is_private is None:
                     is_private = meta["is_private"]
@@ -962,6 +1178,35 @@ class MonitorService:
                      r.get("reel_data"))
                 )
 
+        # Which of them may spend a live reel call on their highlight catalog.
+        #
+        # The catalog has exactly one source — the reel query — and while the
+        # profile API is shut, nothing free carries it: the page has never
+        # known it, the Worker's reel route is refused per colo, and the phone
+        # is 429'd on it. So the story phase, which correctly refuses to
+        # re-ask the reel route for a STATUS the page already answered, was
+        # also declining to ask for a catalog nothing else can answer — and
+        # the stored one quietly aged.
+        #
+        # A catalog is not a status, though. It changes when its owner adds a
+        # highlight, it is re-listed at most once per HIGHLIGHT_SCAN_INTERVAL
+        # anyway, and this runs AFTER every check, so a refused ~9 s call
+        # costs the sweep's readings nothing. Capped per sweep so a run where
+        # every account is due (a fresh install, or a long spell with no
+        # source) cannot turn into seventeen of them; the sweep order is
+        # shuffled, so over a few sweeps every due account gets its turn.
+        catalog_refresh: set[int] = set()
+        for aid, _, ig_id, _ in story_targets:
+            if len(catalog_refresh) >= _CATALOG_REFRESH_PER_SWEEP:
+                break
+            if ig_id and self._highlight_scan_overdue(aid, highlight_stamps):
+                catalog_refresh.add(aid)
+        if catalog_refresh:
+            logger.info(
+                "Highlight catalogs due a live re-read this sweep: {} of {} "
+                "public account(s)", len(catalog_refresh), len(story_targets),
+            )
+
         if self.stories is not None and story_targets:
             # With the gate down, the per-account fallback reel query is 8 more
             # blocked upstream attempts each for an answer we already know we
@@ -973,6 +1218,7 @@ class MonitorService:
                     self._check_stories_and_highlights(
                         aid, uname, instagram_id=ig_id, reel_data=reel,
                         skip_reel_fallback=throttle.gate_down,
+                        catalog_due=aid in catalog_refresh,
                     )
                     for aid, uname, ig_id, reel in story_targets
                 ),
@@ -1054,32 +1300,15 @@ class MonitorService:
             if failed:
                 names = ", ".join(f"@{u}" for u in sorted(failed_usernames))
                 summary += f" {failed} failed: {names}"
-            if page_only:
-                summary += (
-                    f"\n📄 {page_only} read from the profile page — followers, "
-                    "following, bio and privacy are live; reel and highlight "
-                    "counts carried forward."
-                )
-            if id_only:
-                summary += (
-                    f"\n🪪 {id_only} checked by Instagram ID only — username, "
-                    "picture and story status are live; followers, bio and "
-                    "counts couldn't be read this time and were not guessed."
-                )
-            if throttle.username_door_closed and known_closed:
-                summary += (
-                    "\n🚪 Instagram's profile API is still refusing username "
-                    "lookups (checked once this sweep), so the sweep used the "
-                    "ID route and the profile page."
-                )
-            elif throttle.username_door_closed:
-                summary += (
-                    "\n🚪 Instagram's profile API refused every username "
-                    f"lookup ({throttle.peak_consecutive_user_blocks} in a "
-                    "row), so the rest of the sweep skipped it and used the "
-                    "ID route and the profile page."
-                )
-            elif known_closed and throttle.username_door_answered:
+            # Which door each reading came from — the 📄 page-only and 🪪
+            # id-only lines, and the 🚪 verdict on the profile API — used to
+            # ride along here. They are the same three sentences every sweep,
+            # they describe a standing condition rather than something that
+            # just happened, and they turned one notification into four. They
+            # live in /status now (see `last_sweep`), where they are there
+            # when they are wanted. The API REOPENING is still news: it is a
+            # change, and it means full readings are back.
+            if known_closed and throttle.username_door_answered:
                 summary += (
                     "\n🔓 Instagram's profile API is answering username "
                     "lookups again — full readings are back."
@@ -1114,12 +1343,32 @@ class MonitorService:
                 )
         await self.notifier.send_text(summary)
 
-        # The home fetcher's part in this sweep goes out as its own message,
-        # not tucked onto the summary — the owner asked to see it on its own.
-        if settings.home_fetch_token and home_fetch.broker.last_seen_seconds is not None:
-            await self.notifier.send_text(
-                self._home_fetcher_line(home_fetch.broker.delivered - home_pages_before)
-            )
+        # The home fetcher's part in this sweep is RECORDED, not announced.
+        # It went out as its own message every sweep, which on a healthy run
+        # is a second notification saying the phone did nothing — the phone
+        # is a fallback, so "0 pages this sweep" is the normal, good answer
+        # and not news. It lives on the phone button in /status now, where it
+        # is there when it is wanted. A dying battery still interrupts.
+        home_fetch.broker.note_sweep(
+            home_fetch.broker.delivered - home_pages_before
+        )
+
+        # Where this sweep's readings came from, for /status. Standing
+        # conditions belong on a screen you open, not in a notification that
+        # repeats them verbatim every half hour.
+        self.last_sweep = {
+            "at": datetime.now(timezone.utc),
+            "checked": checked,
+            "answered": answered,
+            "page_only": page_only,
+            "id_only": id_only,
+            "failed": failed,
+            "deferred": deferred,
+            "recovered": recovered,
+            "door_closed": throttle.username_door_closed,
+            "door_answered": throttle.username_door_answered,
+            "gate_down": throttle.gate_down,
+        }
 
         result = {
             "checked": checked,
@@ -1267,24 +1516,6 @@ class MonitorService:
         return text, len(rows), accounts
 
     @staticmethod
-    def _home_fetcher_line(pages: int) -> str:
-        """The phone's part in this sweep, with its battery — the owner asked
-        for the battery to be visible where the sweep reports, not only in
-        /status."""
-        broker = home_fetch.broker
-        state = "connected" if broker.connected else "not connected"
-        battery = ""
-        if broker.battery is not None:
-            charge = (
-                "" if broker.charging is None
-                else " (charging)" if broker.charging else " (not charging)"
-            )
-            battery = f" · battery {broker.battery}%{charge}"
-        name = broker.worker or "phone"
-        noun = "page" if pages == 1 else "pages"
-        return f"🏠 Home fetcher ({name}): {state}, {pages} {noun} this sweep{battery}"
-
-    @staticmethod
     def _prefetch_reels(users: list[tuple[str, str]]) -> None:
         """Ask the home fetcher for every reel query a sweep will need."""
         if not settings.home_fetch_token or not users:
@@ -1324,7 +1555,8 @@ class MonitorService:
         }
 
     async def _staggered_check(
-        self, throttle: "_SweepThrottle", account_id: int, username: str
+        self, throttle: "_SweepThrottle", account_id: int, username: str,
+        *, instagram_id: Optional[str] = None,
     ) -> dict:
         """Run one sweep check inside a slot of the shared throttle.
 
@@ -1341,9 +1573,15 @@ class MonitorService:
             if throttle.is_open():  # tripped while this one waited its turn
                 throttle.note_skip()
                 return self._breaker_skipped_result(username)
+            # Off the pending list before the check runs: this account is
+            # fetching its own page now, so a handover triggered by its own
+            # refusal must not ask the phone for it a second time.
+            throttle.note_started(username)
             result = await self._run_check(
                 account_id, username, thorough=False,
                 skip_username_api=throttle.username_door_closed,
+                instagram_id=instagram_id,
+                paced=True,  # the throttle slot above IS the spacing
             )
             # Recorded inside the slot so the next account's pacing — and any
             # cooldown this block just triggered — already accounts for it.
@@ -1352,15 +1590,28 @@ class MonitorService:
                 id_status=result.get("id_status"),
                 api_status=result.get("api_status", _NOT_GIVEN),
             )
-            # The first refusal of the username API is the moment to hand the
-            # home fetcher the rest of the list: every account after this one
-            # will need its page.
-            if not throttle.pages_prefetched and (
-                throttle.username_door_closed
-                or result.get("api_status") in (401, 403)
+            # The moment to hand the home fetcher the rest of the list is
+            # when BOTH username-side doors have failed for this account: the
+            # API refused, and this host's own page request did not answer.
+            # The API alone is not enough any more — while this host can
+            # still fetch pages it does so in half a second, and handing the
+            # phone the whole list then is a fetch per account that nothing
+            # reads, spent against the home line's own standing.
+            if (
+                not throttle.pages_prefetched
+                and (
+                    throttle.username_door_closed
+                    or result.get("api_status") in (401, 403)
+                )
+                and self.instagram.direct_page_door_failing
             ):
                 throttle.pages_prefetched = True
-                self._prefetch_pages(throttle.sweep_usernames)
+                logger.info(
+                    "This host's page door stopped answering — handing the "
+                    "home fetcher the {} account(s) still to check",
+                    len(throttle.pending_usernames),
+                )
+                self._prefetch_pages(throttle.pending_usernames)
             # And the verdict is written the moment it is reached, not at the
             # end of the sweep — a restart mid-sweep must not forget it.
             if throttle.username_door_closed and not throttle.door_recorded:
@@ -1435,6 +1686,7 @@ class MonitorService:
                 retry = await self._run_check(
                     aid, uname, thorough=False,
                     skip_username_api=skip_username_api,
+                    paced=True,  # the round's cooldown and gaps are the spacing
                 )
                 if retry.get("ok"):
                     outcomes[idx] = (aid, uname, retry)
@@ -1455,6 +1707,8 @@ class MonitorService:
         notify_unchanged: bool = False,
         thorough: bool = True,
         skip_username_api: bool = False,
+        instagram_id: Optional[str] = None,
+        paced: bool = False,
     ) -> dict:
         """One full check. `thorough` (the default) lets a blocked fetch try
         every colo it can — right for on-demand checks, which are one account
@@ -1463,19 +1717,50 @@ class MonitorService:
         Instagram's gate shut, and the paced retry rounds are the second
         chance instead. `skip_username_api` leaves the username API alone
         (the id route and the page doors still run) — a sweep sets it once
-        that API has refused every lookup so far."""
+        that API has refused every lookup so far.
+
+        `paced` says the caller already holds a sweep slot and has spaced this
+        check itself. Everything else — stakeout ticks, card rechecks — waits
+        out `_OFF_SCHEDULE_MIN_GAP_SECONDS` first, so it slots into the same
+        rhythm instead of arriving on top of it. Every check stamps the clock
+        on the way out, sweep checks included, or the sweep's own traffic
+        would be invisible to the gate."""
         async with self._semaphore:
+            if not paced:
+                await self._await_off_schedule_slot()
             try:
                 started = time.monotonic()
                 result = await self._do_check(
                     account_id, username, notify_unchanged,
                     thorough=thorough, skip_username_api=skip_username_api,
+                    instagram_id=instagram_id,
                 )
                 self._log_check_timing(username, result, time.monotonic() - started)
                 return result
             except Exception as exc:
                 logger.exception("Unhandled error checking @{}: {}", username, exc)
                 return {"ok": False, "username": username, "error": repr(exc)}
+            finally:
+                self._last_check_at = time.monotonic()
+
+    async def _await_off_schedule_slot(self) -> None:
+        """Hold an off-schedule check back until the gap has passed.
+
+        The lock is held across the wait on purpose: two stakeouts coming due
+        in the same second must leave one after the other, not together."""
+        gap = _OFF_SCHEDULE_MIN_GAP_SECONDS
+        if gap <= 0:
+            return
+        async with self._off_schedule_gate:
+            wait = self._last_check_at + gap - time.monotonic()
+            if wait > 0:
+                logger.debug(
+                    "Off-schedule check waiting {:.1f}s so it does not land on "
+                    "top of the last one", wait,
+                )
+                await asyncio.sleep(wait)
+            # Claim the slot, so a second waiter measures from here.
+            self._last_check_at = max(self._last_check_at, time.monotonic())
 
     @staticmethod
     def _log_check_timing(username: str, result: dict, total: float) -> None:
@@ -1497,6 +1782,7 @@ class MonitorService:
         *,
         thorough: bool = True,
         skip_username_api: bool = False,
+        instagram_id: Optional[str] = None,
     ) -> dict:
         logger.info("Checking @{}", username)
         timings: dict[str, float] = {}
@@ -1509,7 +1795,11 @@ class MonitorService:
         # One call: current username, avatar URL, story/live status and the
         # highlight catalog — the story phase reuses it, so nothing below
         # asks the reel question twice.
-        instagram_id = await self._stored_instagram_id(account_id)
+        # A sweep already read every account row to build its list, so it
+        # hands the id down rather than paying a session checkout, a pool
+        # ping and a round trip per account to read it again.
+        if not instagram_id:
+            instagram_id = await self._stored_instagram_id(account_id)
         probe: Optional[IdProbe] = None
         if instagram_id:
             clock = time.monotonic()
@@ -2197,7 +2487,10 @@ class MonitorService:
         # there; afterwards a rise in the post/reel count delivers the new media.
         if self.stories is not None and not effective_private:
             await self._handle_new_posts(
-                account_id, username, changeset, first_seen=last_known is None
+                account_id, username, changeset, first_seen=last_known is None,
+                # Could this reading read a count at all? A full API answer
+                # always can; a page reading never can.
+                counts_seen=not fetch.partial or "posts_count" in parsed,
             )
 
         return {
@@ -2452,6 +2745,26 @@ class MonitorService:
     def _highlight_scan_key(account_id: int) -> str:
         return f"highlight_scan:{account_id}"
 
+    @classmethod
+    def _highlight_scan_overdue(
+        cls, account_id: int, stamps: dict[str, str]
+    ) -> bool:
+        """Is this account's full highlight re-scan due, per one batched read
+        of the `highlight_scan:` stamps? Same clock as `_due_highlight_scan`,
+        asked before the sweep instead of during it, so the sweep can decide
+        up front whether an account's reel query is worth asking the phone
+        for at all."""
+        interval = settings.highlight_scan_interval
+        if interval <= 0:
+            return True
+        raw = stamps.get(cls._highlight_scan_key(account_id))
+        if not raw:
+            return True
+        try:
+            return (time.time() - float(raw)) >= interval
+        except ValueError:
+            return True
+
     async def _due_highlight_scan(
         self,
         account_id: int,
@@ -2502,6 +2815,7 @@ class MonitorService:
         reel_data: Optional[dict] = None,
         always_report: bool = False,
         skip_reel_fallback: bool = False,
+        catalog_due: bool = False,
     ) -> None:
         """Stories, highlight catalog changes, and new highlight media for public accounts.
 
@@ -2522,9 +2836,21 @@ class MonitorService:
         already established that Instagram is blocking everything — the status
         is reported as unavailable without spending 8 more blocked upstream
         attempts to confirm it. The saveinsta story fetch below still runs.
+
+        A page-derived `reel_data` is topped up from the phone's own reel
+        answer when one has landed for this account — free, already fetched,
+        and the only source for the live flag and the highlight catalog while
+        the username API is shut. Nothing is asked for here to get it.
+
+        `catalog_due` allows ONE live reel call for the highlight catalog
+        when nothing free carried it and this account's catalog is past its
+        re-scan interval. It is the only thing that overrides the
+        don't-re-ask rule, because it is the only thing that rule gets wrong:
+        the story status the page already answered, the catalog it never
+        can. The caller caps how many accounts get this per sweep.
         """
         assert self.stories is not None
-        async with self._semaphore:
+        async with self._story_semaphore:
             try:
                 async with get_session() as session:
                     previous_catalog = await crud.get_highlight_catalog(
@@ -2541,6 +2867,28 @@ class MonitorService:
                 # A page-derived status arrives with the reel route already
                 # refused this check: don't knock again, and leave the stored
                 # highlight catalog as it is.
+                if reel_data is not None and reel_data.get("from_page") and instagram_id:
+                    # The page answered the story question, and the phone's
+                    # reel answer for this account has since landed — it was
+                    # asked for at the top of the sweep and arrives after the
+                    # pages. Reading it costs nothing: no request, no wait.
+                    # It carries the two things the page never knows, the live
+                    # flag and the highlight catalog. The page keeps the story
+                    # flag: that is this check's own live reading, and the one
+                    # already weighed against the stored baseline.
+                    in_hand = self.instagram.reel_in_hand(str(instagram_id))
+                    if in_hand is not None:
+                        reel_data = {
+                            **reel_data,
+                            "is_live": bool(in_hand.get("is_live")),
+                            "highlights": in_hand.get("highlights") or {},
+                        }
+                        logger.debug(
+                            "@{}: filled the live flag and the highlight "
+                            "catalog from the reel the phone already "
+                            "delivered", username,
+                        )
+
                 attempted_reel = bool(reel_data and reel_data.get("from_page"))
                 if reel_data is None and instagram_id and not skip_reel_fallback:
                     attempted_reel = True
@@ -2563,10 +2911,39 @@ class MonitorService:
                 # fetch when no reel query has been attempted at all (e.g. the
                 # numeric id isn't stored yet, which that path resolves).
                 catalog = (reel_data or {}).get("highlights")
-                if catalog is None and not attempted_reel and not skip_reel_fallback:
+                if catalog is None and not skip_reel_fallback and (
+                    not attempted_reel or catalog_due
+                ):
+                    # `catalog_due` overrides the don't-re-ask rule above, and
+                    # only that rule. The rule is right about the STATUS: the
+                    # page already said whether a story is up, so knocking on
+                    # the refused reel route for it buys an answer already in
+                    # hand. It is wrong about the CATALOG, which the page has
+                    # never carried and nothing else can supply — there the
+                    # answer is not known, it is simply missing, and refusing
+                    # to ask is how a stored catalog ages without anyone
+                    # noticing. The caller has already capped how many
+                    # accounts may reach this per sweep.
+                    if attempted_reel:
+                        logger.info(
+                            "@{}: re-reading the highlight catalog — the page "
+                            "answered the story question but has never known "
+                            "the reels, and this catalog is due", username,
+                        )
                     catalog = await self._fetch_highlight_catalog(
                         username, instagram_id
                     )
+                    if catalog:
+                        logger.info(
+                            "@{}: highlight catalog re-read — {} reel(s)",
+                            username, len(catalog),
+                        )
+                    elif attempted_reel:
+                        logger.info(
+                            "@{}: no route answered the reel query, so the "
+                            "stored highlight catalog stands as it was",
+                            username,
+                        )
                 if catalog is None:
                     # Reel query unavailable this check — "unknown", not "empty".
                     # The guard below keeps the stored catalog untouched.
@@ -2946,22 +3323,47 @@ class MonitorService:
                 continue
             path = await self.stories.download(item, username)
             if path is None:
-                logger.warning(
-                    "Could not download story {} for @{}", item.pk, username
-                )
-                if account_id is not None:
-                    async with get_session() as session:
-                        await crud.mark_story_seen(
-                            session,
-                            account_id=account_id,
-                            story_pk=item.pk,
-                            source=item.source,
-                            highlight_id=item.highlight_id,
-                            highlight_title=item.highlight_title,
-                            media_type=item.media_type,
-                            taken_at=item.taken_at,
-                        )
-                seen_pks.add(item.pk)
+                # A failed download used to mark the item SEEN, which retired
+                # it for good: one saveinsta hiccup and a story was lost,
+                # although the next sweep — half an hour later, well inside
+                # the 24 hours a story lives — would very likely have got it.
+                # Marking it seen is still the right end state for an item
+                # that is simply not downloadable, or it would be retried
+                # every sweep forever; it just has to be the end of several
+                # attempts rather than the first.
+                key = (account_id, item.pk)
+                failures = self._download_failures.get(key, 0) + 1
+                # Nothing is persisted for an ad-hoc fetch of an unmonitored
+                # account, so there is no later sweep to retry on.
+                if account_id is None or failures >= _DOWNLOAD_ATTEMPTS:
+                    self._download_failures.pop(key, None)
+                    logger.warning(
+                        "Could not download story {} for @{} after {} "
+                        "attempt(s) — giving up on it",
+                        item.pk, username, failures,
+                    )
+                    if account_id is not None:
+                        async with get_session() as session:
+                            await crud.mark_story_seen(
+                                session,
+                                account_id=account_id,
+                                story_pk=item.pk,
+                                source=item.source,
+                                highlight_id=item.highlight_id,
+                                highlight_title=item.highlight_title,
+                                media_type=item.media_type,
+                                taken_at=item.taken_at,
+                            )
+                    seen_pks.add(item.pk)
+                else:
+                    if len(self._download_failures) > 512:
+                        self._download_failures.clear()  # bound the ledger
+                    self._download_failures[key] = failures
+                    logger.warning(
+                        "Could not download story {} for @{} (attempt {}/{}) "
+                        "— leaving it for the next check",
+                        item.pk, username, failures, _DOWNLOAD_ATTEMPTS,
+                    )
                 continue
 
             if item.source == "highlight":
@@ -2985,6 +3387,7 @@ class MonitorService:
 
             if ok:
                 sent += 1
+                self._download_failures.pop((account_id, item.pk), None)
                 if account_id is not None:
                     async with get_session() as session:
                         await crud.mark_story_seen(
@@ -3000,6 +3403,26 @@ class MonitorService:
                 seen_pks.add(item.pk)
         return sent
 
+    @staticmethod
+    def _post_scan_key(account_id: int) -> str:
+        """Last time this account's grid was LISTED, for the no-count
+        fallback below. Only written when a listing actually came back."""
+        return f"post_scan:{account_id}"
+
+    async def _due_post_scan(self, account_id: int) -> bool:
+        """Is a grid listing due for an account whose post count cannot be
+        read? POST_SCAN_INTERVAL 0 disables the fallback entirely."""
+        interval = max(0, settings.post_scan_interval)
+        if interval == 0:
+            return False
+        async with get_session() as session:
+            raw = await crud.get_setting(session, self._post_scan_key(account_id))
+        try:
+            last = float(raw) if raw else None
+        except ValueError:
+            last = None
+        return last is None or (time.time() - last) >= interval
+
     async def _handle_new_posts(
         self,
         account_id: int,
@@ -3007,12 +3430,22 @@ class MonitorService:
         changeset: ChangeSet,
         *,
         first_seen: bool,
+        counts_seen: bool = True,
     ) -> None:
-        """Download and send new feed posts/reels when the post/reel count rises.
+        """Download and send new feed posts/reels.
 
-        On the first observation we baseline the current grid (mark seen, don't
-        send) so we don't dump a backlog; afterwards each increase delivers the
-        new media. Login-free via saveinsta; degrades to nothing on failure.
+        Normally the COUNT is the trigger: it rises, and only then is the grid
+        listed. On the first observation we baseline the current grid (mark
+        seen, don't send) so we don't dump a backlog. Login-free via
+        saveinsta; degrades to nothing on failure.
+
+        `counts_seen` says whether this reading could read a count at all. The
+        profile page never carries one — `all_media_count` is null on every
+        capture — so while the username API is shut nothing ever rose and new
+        posts stopped being delivered at all, silently, from 2026-09-05. When
+        no count is readable the LISTING is the detector instead, run at most
+        once per POST_SCAN_INTERVAL per account and deduplicated against
+        seen_stories exactly as the count-triggered path is.
         """
         if self.stories is None:
             return
@@ -3025,7 +3458,15 @@ class MonitorService:
                 and reels_change.old is not None and reels_change.new > reels_change.old)
         )
         if not first_seen and not increased:
-            return
+            if counts_seen:
+                return
+            # No count to rise — the grid listing is the only detector left.
+            if not await self._due_post_scan(account_id):
+                return
+            logger.debug(
+                "@{}: listing the grid — no post count is readable from this "
+                "source, so a rise cannot be what triggers it", username,
+            )
 
         try:
             posts = await self.stories.fetch_posts(username)
@@ -3033,7 +3474,24 @@ class MonitorService:
             logger.warning("Post fetch failed for @{}: {}", username, exc)
             return
         if not posts:
+            # Nothing came back: the source failed, or the account has an
+            # empty grid. Either way this was not a reading, so the clock is
+            # not stamped and the next sweep tries again — said out loud,
+            # because a listing that answers nothing EVERY time is otherwise
+            # indistinguishable from one that answers "nothing new", and a
+            # silently dead detector is the thing this fallback exists to
+            # end, not to reproduce.
+            logger.info(
+                "@{}: the grid listing came back empty — nothing to compare "
+                "against, so the next check asks again", username,
+            )
             return
+        # A listing that came back IS the scan — stamped even when nothing in
+        # it is new, because "nothing new" is the answer, not a failure.
+        async with get_session() as session:
+            await crud.set_setting(
+                session, self._post_scan_key(account_id), str(time.time())
+            )
 
         if first_seen:
             async with get_session() as session:
@@ -3047,6 +3505,13 @@ class MonitorService:
         async with get_session() as session:
             seen_pks = await crud.get_seen_story_pks(session, account_id)
         new_posts = [p for p in posts if p.pk and p.pk not in seen_pks]
+        # One line whichever way it went. "Nothing new" is a real answer and
+        # the common one, so it has to be visible: without it the only proof
+        # that posts are still being watched was a post actually arriving.
+        logger.info(
+            "@{}: grid listed — {} post(s), {} the chat has not seen",
+            username, len(posts), len(new_posts),
+        )
         if not new_posts:
             return
         new_posts = new_posts[:5]  # cap so a big jump never floods the chat

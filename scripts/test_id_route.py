@@ -158,6 +158,10 @@ class ScriptedInstagram:
             username=u, http_status=401, error="HTTP 401"
         )
         self.probe: Callable[[str], IdProbe] = lambda i: IdProbe(user_id=i, status=401)
+        # This host's page door, as the client reports it. The sweeps
+        # modelled here are the page-served regime, where it is refusing and
+        # the phone is the route.
+        self.direct_page_door_failing = True
         self.profile_calls: list[str] = []
         self.profile_kwargs: list[dict] = []
         self.probe_calls: list[str] = []
@@ -182,6 +186,12 @@ class ScriptedInstagram:
 
     async def fetch_reel_user(self, user_id: str):
         return None
+
+    def reel_in_hand(self, user_id: str):
+        """Reel data already delivered by the phone — the tests that care set
+        `self.in_hand`; the rest have nothing in hand, as on a live sweep
+        whose reels have not landed yet."""
+        return getattr(self, "in_hand", None)
 
     async def fetch_hd_pic_url(self, user_id: str):
         raise AssertionError("must not be called without a session cookie")
@@ -447,6 +457,7 @@ async def _sweep_with(profile, probe, usernames: list[str], *,
     ig.probe = probe
     service = _service(ig)
     result = await service.check_all()
+    ig.service = service  # so a test can read service.last_sweep
     return result, _sent(service), ig
 
 
@@ -464,13 +475,20 @@ async def test_a_shut_username_door_does_not_stop_the_sweep() -> None:
     expect("nothing failed, nothing deferred", result["failed"] == 0 and result["deferred"] == 0,
            repr(result))
     expect("the sweep did NOT stop", "Sweep stopped" not in summary, summary)
-    expect("the summary says the checks were id-only",
-           "checked by Instagram ID only" in summary, summary)
-    expect("and that the username door was shut",
-           "refused every username lookup" in summary, summary)
+    # Which door served the readings is a standing condition, not an event:
+    # it is recorded for /status rather than repeated in the notification.
+    expect("the sweep message is one line, not four",
+           "\n" not in summary, summary)
+    last = ig.service.last_sweep
+    expect("but /status can say the checks were id-only",
+           last["id_only"] == 6, repr(last))
+    expect("and that the username door was shut", last["door_closed"],
+           repr(last))
+    # USERNAME_API_KNOCKS, not SWEEP_BREAKER_THRESHOLD: closing one door and
+    # abandoning the sweep are different calls and take different evidence.
     expect("the username API was asked only until it closed",
-           ig.api_asks() == settings.sweep_breaker_threshold,
-           f"{ig.api_asks()} vs threshold {settings.sweep_breaker_threshold}")
+           ig.api_asks() == settings.username_api_knocks,
+           f"{ig.api_asks()} vs {settings.username_api_knocks} knocks")
     expect("the page doors were still tried for every account",
            len(ig.profile_calls) == 6, repr(ig.profile_kwargs))
     expect("every account was asked by id", len(ig.probe_calls) == 6, repr(ig.probe_calls))
@@ -509,8 +527,8 @@ async def test_retry_rounds_re_ask_by_id_when_the_door_is_shut() -> None:
            result["failed"] == 0 and result["answered"] == 5, repr(result))
     expect("and the summary says so", "recovered on retry" in summary, summary)
     expect("the retry did not re-knock on the username API",
-           ig.api_asks() == settings.sweep_breaker_threshold,
-           f"{ig.api_asks()} API asks vs threshold {settings.sweep_breaker_threshold}")
+           ig.api_asks() == settings.username_api_knocks,
+           f"{ig.api_asks()} API asks vs {settings.username_api_knocks} knocks")
     expect("one extra id ask — the retry", len(ig.probe_calls) == 6, repr(ig.probe_calls))
 
 
@@ -535,8 +553,9 @@ async def test_a_door_found_shut_last_sweep_is_knocked_once() -> None:
     summary = texts[-1]
     expect("exactly one knock on the username API", ig.api_asks() == 1, repr(ig.profile_kwargs))
     expect("every account still got its pages and id", result["answered"] == 4, repr(result))
-    expect("the summary says the door is still shut, checked once",
-           "still refusing" in summary and "checked once" in summary, summary)
+    expect("the door verdict is recorded, not re-announced",
+           ig.service.last_sweep["door_closed"]
+           and "still refusing" not in summary, summary)
     expect("the verdict is refreshed in the DB", await _door_closed_in_db())
 
     # The knock answers: the door reopens for everyone. (Fresh accounts —
@@ -583,20 +602,30 @@ async def test_a_sweep_hands_the_phone_the_whole_list_up_front() -> None:
             lambda i: _answered(i, f"late{int(i) - 1000}"),
             late, door_known_closed=False,
         )
-        expect("the first refusal hands over the whole list",
-               sorted(fake.prefetched) == sorted(late), repr(fake.prefetched))
+        # The account that triggered the handover is fetching its own page
+        # already, so the phone is handed the accounts still to come — not
+        # the whole list including the ones already checked.
+        expect("the first refusal hands over the accounts still to check",
+               set(fake.prefetched) < set(late)
+               and len(fake.prefetched) == len(late) - 1, repr(fake.prefetched))
         expect("the verdict was written during the sweep", await _door_closed_in_db())
-        # The summary names the phone and its battery.
+        # The phone's part in the sweep is RECORDED, not announced: on a
+        # healthy run it did nothing, and a message saying so every sweep is
+        # a notification for good news. It lives on the phone button now.
+        fake = FakeBroker({}, connected=True)
+        home_fetch.broker = fake
         fake.delivered = 3
         result, texts, ig = await _sweep_with(
             lambda u: ProfileFetchResult(username=u, http_status=401, error="HTTP 401"),
             lambda i: _answered(i, f"batt{int(i) - 1000}"),
             [f"batt{i}" for i in range(2)], door_known_closed=True,
         )
-        summary = texts[-1]
-        expect("the summary has a home fetcher line with the battery",
-               "🏠 Home fetcher (xiaomi)" in summary and "battery 92% (not charging)" in summary,
-               summary)
+        expect("no message announces the phone any more",
+               not any("Home fetcher" in t for t in texts), repr(texts[-2:]))
+        expect("the sweep is one message",
+               sum(1 for t in texts if "Sweep complete" in t) == 1, repr(texts[-2:]))
+        expect("but the phone's part is recorded for the button",
+               fake.last_sweep_jobs == 0, repr(fake.last_sweep_jobs))
 
         # A page the phone already delivered is used by the real client without
         # asking again — even if the phone has since dropped off.
@@ -812,6 +841,9 @@ class FakeBroker:
 
     def describe(self) -> str:
         return "connected (worker fake)" if self.connected else "not connected (fake is off)"
+
+    def note_sweep(self, jobs: int) -> None:
+        self.last_sweep_jobs = jobs
 
     def cached(self, username: str):
         return self.cache.get(username)

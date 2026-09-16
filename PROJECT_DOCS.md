@@ -382,7 +382,12 @@ sweep itself is paced by `_SweepThrottle`:
   request rhythm as a manual recheck). The gap is stamped when a check
   *finishes*, so it is a real gap between requests rather than between
   launches: a burst of launches all waiting on a semaphore was the old
-  behavior, and it hit Instagram as one wave.
+  behavior, and it hit Instagram as one wave. A lane also *claims* its
+  departure time on the way in, not just reads it — otherwise every lane
+  waiting on the same `_next_slot` woke to the same instant and left
+  together, which is the burst the whole class exists to prevent. With one
+  lane nothing changes: the check outlasts its own claim, so the finish
+  stamp is the one that lands.
 - **Adaptive pacing** — the gap widens by one step per consecutive 401/403 up
   to `SWEEP_STAGGER_MAX_SECONDS`, and relaxes on success.
 - **A guard that distinguishes a throttle from an outage.** At
@@ -392,6 +397,49 @@ sweep itself is paced by `_SweepThrottle`:
   answered, the gate is shut: stop immediately, skip the retry rounds, and
   skip the per-account reel fallback, because no pace helps and every further
   request is blocked traffic that keeps it shut.
+- **Nothing outruns the pacer.** `_SweepThrottle` only knows about its own
+  sweep, so a stakeout ticking every two minutes, a card Recheck or `/story`
+  fired unpaced requests into the middle of a paced sweep and the burst guard
+  never saw them. Every check now stamps a process-wide clock — sweep checks
+  included — and an OFF-schedule one waits out
+  `_OFF_SCHEDULE_MIN_GAP_SECONDS` (1 s, deliberately under the sweep's own
+  2 s: one account with someone waiting) before it goes. Sweep and retry-round
+  checks pass `paced=True`; they space themselves and must not be paced twice.
+- **A failed media download is retried, then retired.** Marking a story seen
+  on the first failed download lost it for good, although the next sweep — half
+  an hour later, well inside the 24 hours a story lives — would very likely
+  have got it. It now takes `_DOWNLOAD_ATTEMPTS` failures. Counted in memory,
+  so a restart is a fresh start, which is the right side to err on.
+- **Background work is held and reports itself** (`app/utils/tasks.spawn`).
+  The event loop keeps only a WEAK reference to a task, so an unreferenced one
+  can be collected mid-flight — and a whole sweep ran that way from the
+  Telegram button and `POST /sweep`, with any exception surfacing as a GC
+  warning if at all. `spawn` holds the task until it finishes and logs what it
+  raised, against a name that says where it came from.
+- **A door's baseline survives the outage that shut it.** Diffing is
+  source-scoped, so the last API-sourced snapshot is what a returning API
+  check measures against — and three separate things used to destroy it, all
+  of them only after the outage had run a while. The door marker lives in
+  `raw_response`, which the retention purge nulled wholesale: a marker-less
+  row reads as the API's, so week-old page rows began impersonating API ones
+  and a returning check would diff its counts against the page's. The purge
+  now strips the payload and KEEPS the marker. `get_latest_snapshot_by_source`
+  scanned 25 rows and returned "no baseline" once this door had not answered
+  for 25 changes; it now widens to the retained history (200/account) on a
+  miss, and only on a miss. And `purge_old_data` preserved the newest row per
+  ACCOUNT, which is only ever whichever door answered last; it now also keeps
+  the newest successful row of EACH door.
+- **A verdict on the username API, kept in `app_settings`.** A sweep that
+  finds it refusing every lookup writes `username_api_closed_at`, and the next
+  sweep — a redeployed process included — knocks ONCE instead of
+  `USERNAME_API_KNOCKS` times. That matters because one knock is ~9 s and six
+  blocked upstream attempts: rediscovering a shut door costs 45 s and thirty
+  refused requests at the old five-knock threshold. Closing one door now takes
+  its own (smaller) evidence rather than borrowing `SWEEP_BREAKER_THRESHOLD`,
+  which is the number for abandoning a sweep. When the verdict is NOT trusted
+  the log says which reason it is — nothing recorded, or recorded and outside
+  `USERNAME_API_RECHECK_SECONDS` (`0` there means never trusted, so a sweep
+  re-pays the discovery every run).
 - **Two doors, booked separately** (2026-09-05). The username route
   (`web_profile_info`) and the numeric-id route (graphql reel query) are
   counted on their own. `SWEEP_BREAKER_THRESHOLD` refused username lookups
@@ -556,16 +604,37 @@ can run neither a port forward nor a Tailscale Funnel. `app/monitor/home_fetch.p
 is the in-memory broker that matches jobs to waiting checks;
 `InstagramClient.probe_home_page` parses the same Relay payload the direct page
 door does, so the reading is a normal `source="public_page"` partial. Order on
-the username side: the API (unless skipped for the sweep), this host's page
-request, the home fetcher. A worker that has not polled for 90 s is "not
-connected": a fast, quiet answer — the sweep stays id-only. About 700 KB per
+the username side: the API (unless skipped for the sweep), then the page — and
+which page door goes first depends on what is already paid for. A page the
+phone has ALREADY delivered (`cached_page_ok`, i.e. a sweep that prefetched
+it) is taken straight away; otherwise this host asks first and the home
+fetcher is the fallback. That ordering matters twice over: this host's door
+costs up to 12 s per account and answers 429, and each of those refusals is
+one more strike against an IP already out of favour. A manual check still
+asks this host first, which is what keeps the door under test rather than
+written off. A worker that has not polled for 90 s is "not connected": a fast, quiet answer — the sweep stays id-only. About 700 KB per
 page from Instagram, a few KB (the extracted payload) back to the bot.
 
-The sweep never waits on the phone by design. It hands the broker its whole
-list up front (`broker.prefetch`) — at sweep start when the username API is
-known shut, else at the first refusal — and the phone works through it, a
-batch per poll (`?batch=8`), uploading in the background, while the sweep
-does its id probes. Each check then finds its page in the broker's cache
+The phone is INSURANCE, not the default route. It is handed a sweep's pages
+only once this host's own page door has stopped answering
+(`InstagramClient.direct_page_door_failing` — two refusals in a row, below
+the breaker's third but above one, because a single login-walled page is not
+a shut door: on a one-refusal rule one odd account handed the phone fifteen
+pages it delivered 80 s after the sweep had already read them all from here) — at sweep start when that is already true, else the moment a
+check finds both username-side doors shut, and then only for the accounts
+still to check. While Instagram serves this host's page requests, which it
+does again (measured 2026-09-07: 17 of 17, half a second each), the phone
+gets nothing: 17 fetches nobody reads are 17 requests spent against the home
+line's own good standing. The same signal sets the pace — the 0.2 s gap
+belongs to a sweep making no requests of its own; when THIS host is fetching
+the pages the gap stays at `_SWEEP_STAGGER_SECONDS`, because 17 direct
+requests in twelve seconds from a datacenter IP is the burst that earns the
+429 the phone exists to work around.
+
+When the phone IS the route, the sweep never waits on it. It hands the broker
+the list up front (`broker.prefetch`) and the phone works through it, a batch
+per poll (`?batch=8`), uploading in the background, while the sweep does its
+id probes. Each check then finds its page in the broker's cache
 (`cached_page_ok`, fresh for 15 min; manual checks ask fresh) and only waits
 when it is still on its way. Every delivery logs the pickup and delivery
 latency, so a slow link shows up as numbers, not as a slow sweep. The worker
@@ -576,16 +645,86 @@ The page also carries `latest_reel_media` (0 = no active story, else its
 timestamp; verified against the reel query). When the reel route refuses an
 account, `_handle_success` builds the story status from the page
 (`reel_data["from_page"]`), the story phase does not knock on the reel route
-again, and the highlight catalog is left as stored. The sweep summary ends with
-a home-fetcher line: connection, pages this sweep, battery.
+again, and the highlight catalog is left as stored.
+
+New posts are found by the post COUNT rising — and the profile page carries
+no count (`all_media_count` is null on every capture), so from the day the
+username API was walled nothing rose, no grid was listed and no post was
+delivered, with no error anywhere to say so. When a reading cannot read a
+count (`counts_seen=False`), the grid listing becomes the detector instead:
+one saveinsta round trip per public account per `POST_SCAN_INTERVAL`,
+deduplicated against `seen_stories` exactly as the count-triggered path is. A
+listing that comes back stamps the clock even when nothing in it is new (that
+is the answer); an empty one does not, so a failed source is retried next
+sweep.
+
+The highlight catalog is the one thing with no fallback: the page has never
+carried it, so while the profile API is shut it lives or dies on the reel
+query. The story phase's rule against re-asking that route is right for the
+story STATUS (the page already answered it) and wrong for the catalog (the
+page never can) — followed for both, the stored catalog aged silently. So a
+sweep picks up to `_CATALOG_REFRESH_PER_SWEEP` public accounts whose catalog
+is past `HIGHLIGHT_SCAN_INTERVAL` and lets each spend one live reel call
+(`catalog_due`). It runs after every check, so a refused ~9 s call costs the
+sweep's readings nothing; the sweep order is shuffled, so every due account
+gets its turn over a few sweeps; a failed re-read leaves the stored catalog
+exactly as it was rather than emptying it; and a shut gate suppresses it
+entirely.
+
+Reel jobs stop going to the phone after `REEL_REFUSALS_BEFORE_PAUSE`
+refusals in a row (Instagram 429s that query from the home line). The refusal
+is not free: the worker reads it as "wait a few minutes" and stops fetching
+ANYTHING for a minute, so a reel nobody can have costs the phone the page
+door it exists for — which is how a live page request came to time out at
+30 s. Pages are never held back by this.
+
+The sweep-complete message is one line. Which door served the readings — the
+page-only and id-only counts, and the verdict on the profile API — is a
+standing condition rather than an event, so it is recorded in
+`MonitorService.last_sweep` and shown in `/status` instead of being repeated
+verbatim every half hour. The API REOPENING is still announced: that is a
+change, and it means full readings are back.
+
+The phone's part in a sweep is recorded, not announced (`broker.note_sweep`):
+on a healthy run it is 0 — the phone was not needed — and a message saying so
+after every sweep is a notification for good news. It lives on the **📱 Phone**
+button in `/status`, which shows the worker, connection, last poll, battery
+and what it delivered last sweep. The one thing that still interrupts is the
+battery, and only on a rung of `HOME_FETCH_BATTERY_ALERTS` (default
+50/20/10/5), each firing at most once per discharge — plugging it in is
+announced once and re-arms them.
 
 Reel queries go through the phone too (job kind `reel`, keyed by numeric id;
-a worker declares what it fetches in `X-Watcher-Kinds`). `check_all` prefetches
-every account's reel query at sweep start; `probe_by_id(cached_ok=True)` reads
-the phone's answer from the broker's cache first, then the Worker, and after
-three Worker refusals in a row asks the phone live first for 10 minutes. A
-sweep's guard counts a page-served check as answered (`status == 200`), not
+a worker declares what it fetches in `X-Watcher-Kinds`). `probe_by_id(cached_ok=True)`
+reads the phone's answer from the broker's cache first, then the Worker, and
+after three Worker refusals in a row asks the phone live first for 10 minutes.
+A sweep's guard counts a page-served check as answered (`status == 200`), not
 by the API door alone — the bug that paused sweeps and widened the gap.
+
+Which accounts get a reel query depends on what a reel still answers. While
+the username API is shut and the phone is serving pages, the page already
+answers the story question, so a reel adds only the live flag and the
+highlight catalog — and the catalog is re-listed at most once per
+`HIGHLIGHT_SCAN_INTERVAL`. So `check_all` prefetches reels for the accounts
+whose catalog is actually due (one batched read of the `highlight_scan:`
+stamps decides) and that are not known to be private, not for every account:
+asking for all of them was a second Instagram request per account per sweep,
+on the same home line the page door depends on, for an answer nothing read.
+A private account was the worst of it — the story phase skips it, so its scan
+stamp never advanced and it read as permanently due, buying a reel every
+sweep forever for something with no story, no live flag and no visible
+highlights in it. Privacy comes from `crud.latest_privacy_by_account`, one
+query over the newest successful snapshot per account, and only a flag
+actually SEEN counts: unknown means ask, so a new target is never silently
+skipped, and a private account going public is announced by the page (the
+backlog grab lists its highlights itself and stamps the scan key) and treated
+normally from the next sweep. What the phone does deliver is read
+by the story phase (`InstagramClient.reel_in_hand`) — free, already fetched,
+no request and no wait — to fill the live flag and the catalog a page-derived
+status cannot know. That read is bounded to 5 minutes (`_REEL_IN_HAND_MAX_AGE`,
+well under the broker's own 15-minute result TTL) so the previous sweep's
+answer is never announced as this one's. Any older and it is treated as
+nothing in hand, and the page's own answer stands.
 
 This host's own page request is bounded to 12 s and, after three refusals in
 a row (429, login redirect, empty shell, timeout), skipped for 30 minutes so
