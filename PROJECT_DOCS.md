@@ -455,9 +455,23 @@ sweep itself is paced by `_SweepThrottle`:
   bounded by `SWEEP_RETRY_BUDGET_SECONDS`) re-check blocked accounts one at a
   time. A block lands on a *request*, not an account, so a paced retry often
   goes through — this is what stops the summary reporting failures the owner
-  can reproduce as successes by hand a minute later.
+  can reproduce as successes by hand a minute later. By id only (the
+  username API shut), a round that recovers nothing ends the pass unless a
+  page door opened during it (the tunnel came back, the phone connected):
+  the id route's gate refuses per account, and on 2026-10-20 the same 13
+  accounts were refused on the sweep and on both rounds, five minutes of
+  Worker calls for nothing. The first round always runs.
 - **Order is shuffled every sweep**, so the same tail of accounts doesn't
-  absorb every block sweep after sweep.
+  absorb every block sweep after sweep — **except that accounts whose last
+  check failed go first** (`consecutive_failures > 0`, so it survives a
+  restart; shuffled within each group). They hold the oldest readings, the
+  front of a sweep is where the gate is coolest, and the phone fetches pages
+  in sweep order, so theirs come back first.
+- **A late phone page waits for the retry round.** When the phone has a page
+  in hand but has not delivered it (`ProfileFetchResult.page_pending`), the
+  first pass does not settle for an id-only reading — that would count as an
+  answer and the retry round would never come back for the full page. Only a
+  page still late in the retry round falls back to the id route.
 
 ### 6.3 WatcherScheduler (`app/workers/scheduler.py`)
 
@@ -677,6 +691,129 @@ is not free: the worker reads it as "wait a few minutes" and stops fetching
 ANYTHING for a minute, so a reel nobody can have costs the phone the page
 door it exists for — which is how a live page request came to time out at
 30 s. Pages are never held back by this.
+
+**2026-10-18 — the phone is the route again, and four things it got wrong.**
+Instagram now sends this host's page requests to its login page (Render's
+~416 KB "page" with no payload is the 417 KB `/accounts/login/?next=…`
+page; `_probe_page_direct` now names that), the Worker's `?page=` route is
+still 429, and the profile Relay query by `doc_id` answers `null` to a
+logged-out caller even with a real LSD token. So without the phone (or a
+residential proxy) a sweep reads usernames, avatars and story status by id
+and no counts at all — the summary says so once when it starts and once when
+it ends (`_counts_blind_note`, persisted as `counts_blind_since`). With the
+phone up, five accounts still failed every sweep:
+
+- A profile page carries `"xig_user_by_username"` **twice** — the profile
+  query and the posts-grid query (`pk`, `id`, timeline only) — in either
+  order. Both the bot's parser and the worker took the first; grid-first
+  accounts (@leen_m204, @jeeda.younes, @talia.takheen, @__ralanee__) failed
+  as "no profile payload". Both now pick the block with the profile's fields.
+  The worker reports `X-Watcher-Version` (2 = this fix) and the bot messages
+  the owner once when the phone runs an older copy, with the update command.
+  That command fetches the script from the bot (`GET /home-fetch/worker.py`,
+  token-gated, the file bundled into the image by the Dockerfile) — the
+  phone's line timed out on raw.githubusercontent.com — and from version 3
+  the worker does it itself: `python home_fetcher.py --update`.
+- A renamed or deleted account's old page is an error shell, and with the
+  phone up the id route was cache-only — so "renamed", "gone" and "bad page"
+  looked the same forever (@vrcuvr). A sweep check whose page fails now asks
+  by id through the Worker (`probe_by_id(ask_phone=False)`) before giving up.
+- The phone's upload connections sat idle between sweeps and a NAT forgot
+  them silently: pages fetched in ~2 s reached the bot 111 s after pickup, as
+  each upload sat out the 90 s timeout. `BotLink` reopens a connection idle
+  for more than `IDLE_RECONNECT_SECONDS` (20 s).
+- A cached page with no payload was parsed and logged twice per check, and
+  the failure said only "username API skipped"; it now names each page
+  door's answer.
+
+**The page tunnel (2026-10-18) — counts without the phone.** Instagram serves
+the page by IP reputation, not "home vs datacenter": the owner's PC got full
+pages through Proton VPN (M247, Bucharest), a datacenter network, while
+Render's IP is sent to the login page whatever headers it sends (the owner's
+own browser test: `"country_code":"RO"` in the served page). So
+`app/monitor/page_tunnel.py` runs wireproxy — userspace WireGuard exposed as
+a localhost SOCKS5 proxy, built from source in the Dockerfile — and routes
+ONLY this host's profile-page request through it. Configured by a WireGuard
+.conf (Proton: account.protonvpn.com → Downloads → WireGuard configuration)
+as a Render Secret File `page_tunnel.conf`, or `PAGE_TUNNEL_CONFIG` (text or
+path); `PAGE_PROXY_URL` is the plain-proxy alternative. Nothing is routed
+until a request through it has come back; a down tunnel leaves the page door
+as it was and the no-counts notice names it; a watchdog restarts it. While
+it serves pages, a sweep's id probe is cache-only (as with the phone), which
+also drops the Worker's ~9 s id call per account; the id route is asked only
+when a page fails. Verified on Render the same day with a Proton Free config
+(server RO-FREE#22): Render allows the outbound UDP, and the first check
+(@65xim) read its page "direct, via the page tunnel" in 1.0 s, 9 of 11
+fields. Render logs "Detected a new open port UDP:…" for wireproxy's socket;
+that is harmless, nothing is exposed. Proton Free allows one connection at a
+time, and a config Instagram stops serving is replaced by one for another free
+server in the same secret file.
+
+**The tunnel is proven, not just kept running (2026-10-20).** On 2026-10-20
+wireproxy kept running while nothing came back through it. The watchdog only
+re-checked a tunnel already marked down, so this one stayed "up" for hours:
+19 page timeouts in a row (`curl: (28) Connection timed out`), a 30-minute
+cooldown on the page door, `/status` saying "up", and, with the phone flat
+at 0%, a sweep of 13 failures and 4 id-only readings. Now:
+- an up tunnel is re-proven every `PROVE_INTERVAL` (10 min) through the
+  IP-check site, with a second site as witness so one site's outage is not
+  read as the tunnel's;
+- a page request through it that gets **no answer at all** (a timeout, a
+  reset; not a 429 or a login redirect, which came back through the path)
+  wakes the watchdog to re-prove it at once;
+- a dead path is restarted (a fresh WireGuard handshake from a fresh UDP
+  port), then moved to the **next config**: `page_tunnel.conf` may hold
+  several Proton configs one after another, each from its own `[Interface]`
+  line, named in logs and `/status` by the server Proton writes under
+  `[Peer]` (`# RO-FREE#22`). One connection at a time, so this is failover,
+  not load sharing;
+- a path that works but whose **IP Instagram keeps refusing** is moved on
+  too (2026-10-21). Until then the tunnel moved only when the path was dead:
+  a 429 or a login redirect comes back through the path, so the bot stayed
+  on a refused IP with the other configs unused. Now, when the page door's
+  breaker trips (3 refusals in a row) and Instagram answered at least one of
+  them through the tunnel, the door calls `report_refused`; the watchdog —
+  still the only thing that touches wireproxy — switches to the next config,
+  proves it with the same launch + IP check, and only then routes pages
+  through it. The epoch bump resets the door's cooldown, so the next check
+  tries the new IP at once. One WARNING per move names the old and new
+  server and the reason. Not on one odd page (only the breaker trip), not on
+  timeouts alone (those still go to the restart path above), and never with
+  one config. At most **one lap per 30 min** (`ROTATE_WINDOW`, the door's
+  cooldown): a config refused, or silent when a move sent the tunnel to it,
+  is not moved to again within it, so once every config has been refused
+  the tunnel stays put and the door's cooldown holds. A move whose next
+  configs all stay silent goes back to the refused one, and on the same IP
+  that is not a new route: the cooldown stands. When the tunnel is up and a
+  sweep still reads no counts, the no-counts notice suggests adding configs
+  for more Proton free servers;
+- **boot waits for the first config only** (2026-10-21). `main.py` awaits
+  `tunnel.start()` before the app serves, and `start()` used to try every
+  config in turn. On Render each silent config cost ~20 s (the DNS lookup
+  for the IP check timing out inside the tunnel), so five of them kept the
+  port closed for ~100 s. Now `start()` proves the first config, as before
+  and just as bounded, and if it gives no answer, the watchdog's first look
+  tries the rest at once (`_boot_lap`), not after the 5-minute re-check.
+  With one config, nothing changes;
+- **each config that gives no answer says why.** Before, only the last
+  config's wireproxy output reached the log. Now each one gets its own INFO
+  line: its label, the error, and either "handshake OK, nothing came back"
+  or "no handshake from the server". "No handshake" means the server is dead
+  or UDP is blocked. "Handshake OK" is what Render showed for RO-FREE#22 on
+  2026-10-21: "Received handshake response" and keepalives, then the DNS
+  lookup timing out and curl `(97) SOCKS5 reply 4`. When every config in a
+  lap shook hands and passed nothing, one WARNING per outage says it looks
+  like the Proton account rather than the servers: Proton Free allows one
+  connection, so another device (the PC's or the phone's Proton app) may be
+  holding it;
+- a down tunnel retries on a back-off (5 → 10 → 20 → 30 min), one WARNING
+  per outage and INFO after;
+- the page door's refusal streak is booked against the tunnel's path
+  (`PageTunnel.epoch`), so when the tunnel comes back the door is tried again
+  at once instead of waiting out a cooldown the dead path earned;
+- the sweep-start line no longer says the page door "is answering" when it
+  has been refused and only the phone is missing; it says no page door is
+  open, and why.
 
 The sweep-complete message is one line. Which door served the readings — the
 page-only and id-only counts, and the verdict on the profile API — is a

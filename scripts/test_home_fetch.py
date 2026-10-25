@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import html
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -44,6 +46,12 @@ from app.monitor import home_fetch  # noqa: E402
 from app.monitor.home_fetch import HomeFetchBroker, PageResult  # noqa: E402
 
 FAILURES: list[str] = []
+WORKER_FILE = ROOT / "tools" / "home_fetcher" / "home_fetcher.py"
+
+
+def _repo_worker_version() -> int:
+    match = re.search(r"^WORKER_VERSION = (\d+)", WORKER_FILE.read_text(encoding="utf-8"), re.M)
+    return int(match.group(1)) if match else -1
 
 
 def expect(name: str, condition: bool, detail: str = "") -> None:
@@ -229,6 +237,44 @@ def test_battery_alerts_once_per_rung() -> None:
            repr(settings.battery_alert_levels))
 
 
+def test_an_out_of_date_worker_is_named_once() -> None:
+    """A phone script from before 2026-10-18 sends the posts-grid block for
+    some accounts, every sweep, and nothing on the bot's side can recover the
+    profile from it. The owner hears about it once — with the command that
+    fixes it — not once per poll, and a PC on a current build polling in
+    between does not re-arm the phone's alert."""
+    broker = HomeFetchBroker()
+    broker._worker = "xiaomi"
+    alert = broker.note_version(None)  # a build that sends no version is v1
+    expect("an old build is announced", alert is not None and "out-of-date" in alert
+           and "xiaomi" in alert, repr(alert))
+    expect("with the command that updates it, escaped for Telegram's HTML", alert is not None
+           and html.escape(home_fetch.WORKER_UPDATE_COMMAND, quote=False) in alert
+           and "&&" not in alert, repr(alert))
+    expect("which fetches from the bot, not GitHub",
+           "/home-fetch/worker.py" in home_fetch.WORKER_UPDATE_COMMAND
+           and "github" not in home_fetch.WORKER_UPDATE_COMMAND, home_fetch.WORKER_UPDATE_COMMAND)
+    expect("the next poll says nothing", broker.note_version(None) is None)
+    broker._last_poll = time.monotonic()
+    expect("describe() flags it", "OUT-OF-DATE" in broker.describe(), broker.describe())
+    broker._worker = "pc"
+    expect("a current build is quiet",
+           broker.note_version(str(home_fetch.WORKER_VERSION_CURRENT)) is None)
+    expect("and not flagged", not broker.outdated and "OUT-OF-DATE" not in broker.describe(),
+           broker.describe())
+    broker._worker = "xiaomi"
+    expect("the phone polling again after the PC is still not re-announced",
+           broker.note_version("1") is None)
+    expect("a garbled version reads as old, quietly", broker.note_version("abc") is None
+           and broker.worker_version == 1)
+    current = str(home_fetch.WORKER_VERSION_CURRENT)
+    expect("once updated, it re-arms",
+           broker.note_version(current) is None and broker.note_version("1") is not None)
+    expect("the bot expects the version the worker in this repo reports",
+           home_fetch.WORKER_VERSION_CURRENT == _repo_worker_version(),
+           repr((home_fetch.WORKER_VERSION_CURRENT, _repo_worker_version())))
+
+
 async def test_reel_jobs_go_only_to_a_worker_that_can_fetch_them() -> None:
     """A second job kind, the reel query by numeric id. An older worker build
     fetches pages only and is never handed one; a current build declares
@@ -355,6 +401,39 @@ async def test_endpoints() -> None:
             })
             await asyncio.sleep(0.05)
             expect("the next poll does not alert again", notifier.send_text.await_count == 1)
+
+            # The worker's build rides along too; an out-of-date one is named.
+            home_fetch.broker = HomeFetchBroker()
+            notifier.send_text.reset_mock()
+            r = await client.get("/home-fetch/jobs?wait=0.1", headers={
+                "X-Watcher-Token": "sekrit", "X-Watcher-Worker": "xiaomi",
+                "X-Watcher-Version": str(home_fetch.WORKER_VERSION_CURRENT),
+            })
+            await asyncio.sleep(0.05)
+            expect("a current build polls without a word",
+                   r.status_code == 200 and notifier.send_text.await_count == 0
+                   and home_fetch.broker.worker_version == home_fetch.WORKER_VERSION_CURRENT,
+                   repr(home_fetch.broker.worker_version))
+
+            # The phone updates itself from the bot: GitHub was unreachable
+            # from its line, the bot never is.
+            r = await client.get("/home-fetch/worker.py")
+            expect("the worker script is behind the token", r.status_code == 401, repr(r.status_code))
+            r = await client.get("/home-fetch/worker.py", headers={"X-Watcher-Token": "sekrit"})
+            expect("and served with it, as the file in this repo",
+                   r.status_code == 200 and r.text == WORKER_FILE.read_text(encoding="utf-8"),
+                   repr((r.status_code, r.text[:80])))
+            expect("with its version in a header",
+                   r.headers.get("x-watcher-worker-version") == str(_repo_worker_version()),
+                   repr(dict(r.headers)))
+            r = await client.get("/home-fetch/jobs?wait=0.1", headers={
+                "X-Watcher-Token": "sekrit", "X-Watcher-Worker": "oldphone",
+            })
+            await asyncio.sleep(0.05)
+            expect("a build with no version is told to update, once",
+                   r.status_code == 200 and notifier.send_text.await_count == 1
+                   and "out-of-date" in notifier.send_text.await_args.args[0],
+                   repr(notifier.send_text.await_args_list))
     finally:
         settings.home_fetch_token = old_token
         settings.home_fetch_battery_alerts = old_levels
@@ -369,6 +448,7 @@ async def main() -> int:
     await test_prefetch_batches_and_caches()
     await test_reel_jobs_go_only_to_a_worker_that_can_fetch_them()
     test_battery_alerts_once_per_rung()
+    test_an_out_of_date_worker_is_named_once()
     await test_endpoints()
     print()
     if FAILURES:

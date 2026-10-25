@@ -108,7 +108,7 @@ The Watcher runs as a single container. It connects to your Telegram bot, sweeps
 ### Change Detection
 - Tracks 10+ profile fields: followers, following, posts, reels, highlights, biography, full name, username, external link, verification badge, business flag, public/private status
 - **Works on private accounts** — all profile-level fields above are tracked for private targets, including an alert the moment an account goes private or public
-- Profile-picture change detection — avatars are compared by a perceptual fingerprint that ignores Instagram's per-URL re-encodes (so it never cries wolf) yet catches real swaps, and archived to disk
+- Profile-picture change detection — the same upload (same CDN asset id) is never a change; otherwise avatars are compared as 16×16 grayscale thumbnails, which stay within 2 gray levels across every size and quality Instagram serves one picture at, dark selfies included, while different pictures sit 10+ apart. Archived to disk
 - Story & live status checked every sweep and announced when it changes — one message per story, not one per sweep — plus a live check whenever you open an account card
 - Highlight catalog tracking — detects added, renamed, and removed highlights by name
 - Sweep-complete summary after every run, so you always know the bot is alive
@@ -135,6 +135,7 @@ The Watcher runs as a single container. It connects to your Telegram bot, sweeps
 ### Target Management
 - Add targets by `@username`, full profile URL, or raw numeric Instagram ID
 - Pause/resume per target — paused accounts keep their entire history and resolved Instagram ID
+- 🎞 Media-only alerts per target — one tap on the card keeps its alerts to stories, posts/reels and the profile picture; followers, bio, name, link and privacy are still read and stored, just not sent (📋 Track all turns them back on)
 - Paginated account list with live 🟢 / ⏸ state markers
 - Per-target forced recheck, change history, and stored-photo retrieval
 
@@ -320,6 +321,7 @@ Pacing-on-failure only — none of this ever changes a request, just when (and w
 | `POST_SCAN_INTERVAL` | `1800` | How often to list a public account's grid when the post count can't be read. A **rising count** normally triggers post delivery, but the profile page carries no count — so while the username API is walled, the listing is the detector instead. `0` disables the fallback |
 | `HIGHLIGHT_SCAN_INTERVAL` | `21600` | Seconds between full re-lists of every highlight reel's media. A reel only changes when its owner adds a story to it — and that story was already caught and delivered live minutes earlier. Reels new to the catalog are always listed immediately. `0` = re-list everything every sweep (~12× the traffic) |
 | `AUTO_GRAB_ON_PUBLIC` | `true` | When a monitored account flips private → public, deliver its backlog (only what the chat hasn't already received) instead of silently baselining it |
+| `PHOTOS_AS_FILES` | `true` | Story, post and highlight photos go out as **files**: Telegram re-encodes anything sent as a photo, so the inline picture is its lossy copy; a file is the download byte-for-byte, with a preview, opening in the same viewer. Each photo's caption states its measured size (e.g. `1440×1800`). `false` sends inline photos |
 | `FOLLOWER_ANOMALY_ABS_MIN` | `500` | A follower change is flagged only when it's large in **both** absolute and relative terms, so it never fires on a small account's noise or a big account's drift. Either value at `0` disables the alert |
 | `FOLLOWER_ANOMALY_PCT_MIN` | `0.10` | The relative half of that test (10% of the prior count) |
 | `DIGEST_HOUR` | `9` | Hour (UTC) at which a scheduled digest fires. The mode — off/daily/weekly — is set at runtime with `/digest` |
@@ -333,6 +335,7 @@ Pacing-on-failure only — none of this ever changes a request, just when (and w
 | `IG_PROXY_URL` | _(empty)_ | Cloudflare Worker that proxies **all** Instagram API calls — profile fields, story/live status, highlight catalog, ID-to-username resolution. Strongly recommended on cloud hosts (preset in `render.yaml`); without it the bot makes direct requests, which datacenter IPs usually get 401-blocked on |
 | `HOME_FETCH_TOKEN` | — | Shared secret for [`tools/home_fetcher`](tools/home_fetcher/README.md), the worker on your phone or PC that polls `/home-fetch/jobs` for profile pages to fetch. Same value in the worker's `home_fetcher.env`. Empty = the door is off |
 | `LOG_HEALTH_CHECKS` | `false` | The host pings `/health` every few seconds and uvicorn logs each one — twelve lines a minute of "still alive". Passing checks are hidden; a **failing** one always logs. `true` shows them all |
+| `KEEP_AWAKE_SECONDS` | `300` | Render's free plan sleeps after 15 idle minutes and the next tap waits ~1 minute for it to boot (its own health checks don't count). The bot asks its own public `/health` this often so it never sleeps (every 5 min: one failed ping still leaves the next inside the 15); only on Render (`RENDER_EXTERNAL_URL`, set by Render). Always-on fits the free plan's 750 hours a month for one service. `0` disables |
 | `HOME_FETCH_BATTERY_ALERTS` | `50,20,10,5` | The worker reports its battery with every poll; these are the levels it may interrupt you at, each firing at most once per discharge. "Charging again" is announced once and re-arms them. Empty disables the alerts — the reading still shows on the **📱 Phone** button in `/status` |
 | `USERNAME_API_RECHECK_SECONDS` | `43200` | How long a sweep's verdict that the username API is login-walled is remembered. While it holds, the next sweep knocks on that API once instead of `SWEEP_BREAKER_THRESHOLD` times, and manual checks skip it — the ID route and the page doors still run. Reopens the moment a knock answers |
 | `IG_SWEEP_AUTH_ATTEMPTS` | `1` | How many times a sweep re-asks the Worker after a 401. One Worker call is already 6 upstream attempts, and a sweep multiplies every extra attempt by every account — that traffic is what keeps the gate shut, so the second chance is left to the retry rounds |

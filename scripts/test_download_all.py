@@ -674,6 +674,31 @@ async def test_download_posts_both_kinds() -> None:
     )
 
 
+async def test_photo_caption_states_the_measured_size() -> None:
+    # The caption carries the pixel size of the file actually downloaded, so
+    # "full resolution" is something the chat can check, not a claim.
+    import tempfile
+
+    from PIL import Image
+
+    with tempfile.TemporaryDirectory() as tmp:
+        shot = Path(tmp) / "1.jpg"
+        Image.new("RGB", (1440, 1800), "white").save(shot)
+        service, _ig, stories, notifier = make_real_service(
+            posts=[post("1", "image"), post("2", "video")]
+        )
+        stories.download = AsyncMock(side_effect=lambda item, _u: (
+            shot if item.media_type == "image" else Path(tmp) / "2.mp4"
+        ))
+        await service.download_posts("someuser")
+    photo_caption = notifier.send_photo.await_args.kwargs.get("caption", "")
+    video_caption = notifier.send_video.await_args.kwargs.get("caption", "")
+    expect("a photo's caption states its real size",
+           photo_caption.endswith(" · 1440×1800"), repr(photo_caption))
+    expect("a video's caption is left alone", "×" not in video_caption,
+           repr(video_caption))
+
+
 async def test_download_posts_empty_grid_reports_error() -> None:
     service, _ig, _stories, _notifier = make_real_service(posts=[])
     result = await service.download_posts("someuser")
@@ -841,6 +866,41 @@ async def test_profile_picture_falls_back_to_web_url() -> None:
     )
 
 
+async def test_fallback_avatar_caption_states_its_real_size() -> None:
+    # A private account's avatar comes from the id route or the page: the
+    # 150px variant. It went out captioned "320px" for weeks; the caption
+    # must say what the file measures.
+    import tempfile
+
+    from PIL import Image
+
+    from app.monitor.service import avatar_quality
+
+    with tempfile.TemporaryDirectory() as tmp:
+        shot = Path(tmp) / "pic.jpg"
+        Image.new("RGB", (150, 150), "white").save(shot)
+        service, ig, stories, notifier = make_real_service()
+        stories.fetch_profile_pic_url = AsyncMock(return_value=None)
+        ig.fetch_profile = AsyncMock(return_value=SimpleNamespace(
+            success=True, http_status=200,
+            parsed={"profile_pic_url": "https://ig.example/150.jpg"},
+            raw_response={}, error=None,
+        ))
+        service.hasher.hash_url = AsyncMock(return_value=SimpleNamespace(
+            sha256="ef" * 32, local_path=shot, byte_size=3700,
+            content_type="image/jpeg", source_url="u",
+        ))
+        result = await service.fetch_and_send_profile_picture("someuser")
+        caption = notifier.send_document.await_args.kwargs.get("caption", "")
+    expect("the fallback avatar is measured", result["ok"], f"result={result}")
+    expect("its caption states 150×150", "150×150" in caption, repr(caption))
+    expect("and never claims 320px", "320" not in caption, repr(caption))
+    expect("an HD avatar says HD and its size",
+           avatar_quality({"hd": True, "size": (1080, 1080)}) == "HD · 1080×1080")
+    expect("an unreadable file claims no size",
+           not any(ch.isdigit() for ch in avatar_quality({"hd": False, "size": None})))
+
+
 async def main() -> int:
     # JSONB columns elsewhere don't compile on sqlite; these flows only touch
     # monitored_accounts (get_account / list_accounts).
@@ -871,6 +931,7 @@ async def main() -> int:
     await test_download_posts_filters_photos_only()
     await test_download_posts_both_kinds()
     await test_download_posts_empty_grid_reports_error()
+    await test_photo_caption_states_the_measured_size()
     await test_download_highlights_from_catalog_no_instagram_calls()
     await test_download_highlights_empty_catalog()
     await test_stories_skip_profile_fetch_with_known_id()
@@ -879,6 +940,7 @@ async def main() -> int:
     await test_overview_404()
     await test_fetch_and_send_profile_picture_sends_document()
     await test_profile_picture_falls_back_to_web_url()
+    await test_fallback_avatar_caption_states_its_real_size()
 
     await dispose_engine()
 

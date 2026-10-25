@@ -29,10 +29,10 @@ from app.bot import keyboards
 from app.config import settings
 from app.database import crud
 from app.database.session import get_session
-from app.monitor import home_fetch
+from app.monitor import home_fetch, page_tunnel
 from app.monitor.analytics import compute_rhythm, render_rhythm
 from app.monitor.health import fetch_health, render_health_lines
-from app.monitor.service import MonitorService
+from app.monitor.service import MonitorService, avatar_quality
 from app.utils.formatting import esc, fmt_number, fmt_timestamp, truncate
 from app.utils.logger import logger
 from app.utils.tasks import spawn
@@ -59,6 +59,8 @@ HELP_TEXT = (
     "Tap any account in the list to open its card. From there: "
     "Recheck · History · Photo · Story · Highlights · Remove. "
     "✨ Highlights lists every highlight by name; story/live status shows on the card. "
+    "🎞 Media only keeps an account's alerts to its stories, posts and avatar "
+    "(📋 Track all turns the rest back on). "
     "🏠 Home always returns here.\n\n"
     "<b>Commands</b>\n"
     "<code>/add @user</code>, <code>/add https://instagram.com/user</code>, or <code>/add 1234567890</code> — start monitoring\n"
@@ -513,17 +515,20 @@ async def _reply_or_edit(
     *,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     parse_mode: str = ParseMode.HTML,
-) -> None:
-    """Send text — edit the existing message for callback flows, reply for command flows."""
+):
+    """Send text — edit the existing message for callback flows, reply for command flows.
+
+    Returns the message now showing the text, so a caller can edit it again.
+    """
     if update.callback_query:
-        await _safe_edit_text(
+        return await _safe_edit_text(
             update.callback_query,
             text,
             reply_markup=reply_markup,
             parse_mode=parse_mode,
         )
     elif update.message:
-        await update.message.reply_text(
+        return await update.message.reply_text(
             text,
             parse_mode=parse_mode,
             reply_markup=reply_markup,
@@ -533,8 +538,136 @@ async def _reply_or_edit(
 
 # ---------- View renderers ----------
 
+STORY_CHECKING = "⏳ checking…"
+_STORY_UNAVAILABLE = "⚠️ unavailable (live check didn't answer)"
+# The card's live story check runs AFTER the card is on screen; past this it
+# says it didn't answer rather than leave "checking…" up. The chain behind it
+# (Worker, direct, then saveinsta's three round trips) can otherwise take
+# minutes on a bad day.
+_CARD_LIVE_TIMEOUT = 15.0
+
+
+async def _live_story_state(
+    service: Optional[MonitorService],
+    instagram_id: Optional[str],
+    username: str,
+) -> str:
+    """The card's Story line, from a live check. Never "no" for "couldn't
+    find out"."""
+    has_story: Optional[bool] = None
+    is_live = False
+    live = None
+    if service is not None and instagram_id:
+        try:
+            live = await service.instagram.fetch_reel_user(str(instagram_id))
+        except Exception:  # pragma: no cover - network failure path
+            live = None
+    if live is not None:
+        has_story = bool(live.get("has_public_story"))
+        is_live = bool(live.get("is_live"))
+    elif service is not None and service.stories:
+        # Instagram's graphql reel query is 401-blocked from datacenter IPs
+        # (e.g. Render), so `live` is often None in production. saveinsta is a
+        # third-party host and isn't IP-blocked, so it's the live story oracle
+        # when graphql is unavailable: any items back means an active story.
+        try:
+            has_story = bool(await service.stories.fetch_stories(username))
+        except Exception:  # pragma: no cover - network failure path
+            has_story = None
+    if is_live:
+        return "🔴 live now"
+    if has_story is None:
+        return _STORY_UNAVAILABLE
+    return "🎬 has an active story" if has_story else "⭕ no active story"
+
+
+async def _show_account_card(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    username: str,
+    *,
+    suffix: str = "",
+) -> bool:
+    """Draw the account card NOW and fill its Story line in when it answers.
+
+    The card used to wait for the live story check before drawing anything,
+    and that check is a chain of network calls (the Worker, the direct route,
+    then saveinsta), so every open, recheck, pause and resume sat on
+    "⏳ Opening…" for seconds, on a bad day minutes. Everything else on the
+    card is a database read. False when the account isn't monitored.
+    """
+    service: MonitorService = context.application.bot_data["monitor"]
+    text = await _render_account_card(username, service, story_state=STORY_CHECKING)
+    if text is None:
+        return False
+    text += suffix
+    keyboard = await _actions_keyboard(username, context)
+    shown = await _safe_edit_text(query, text, reply_markup=keyboard)
+    await _fill_story_line(context, shown, username, text, keyboard)
+    return True
+
+
+async def _fill_story_line(
+    context: ContextTypes.DEFAULT_TYPE,
+    shown,
+    username: str,
+    text: str,
+    keyboard: InlineKeyboardMarkup,
+) -> None:
+    """Fill in, in the background, the Story line of a card drawn with
+    STORY_CHECKING. `shown` is the message now showing `text`, already
+    recorded with remember_render."""
+    placeholder = f"Story: {STORY_CHECKING}"
+    if shown is None or placeholder not in text:
+        return  # private account: no Story line to fill
+
+    async with get_session() as session:
+        account = await crud.get_account(session, username)
+    if account is None:
+        return
+    service: MonitorService = context.application.bot_data["monitor"]
+
+    async def _fill() -> None:
+        try:
+            state = await asyncio.wait_for(
+                _live_story_state(service, account.instagram_id, account.username),
+                timeout=_CARD_LIVE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            state = _STORY_UNAVAILABLE
+        # Only a message that still shows THIS card is edited: the user may
+        # have moved on, and the panel may have been re-posted under a new id
+        # (panel_bump), which carries the same text.
+        target = next(
+            (mid for mid, (shown_text, _kb) in reversed(_LAST_RENDER.items())
+             if shown_text == text),
+            None,
+        )
+        if target is None:
+            return
+        filled = text.replace(placeholder, f"Story: {state}", 1)
+        try:
+            await context.bot.edit_message_text(
+                chat_id=shown.chat_id,
+                message_id=target,
+                text=filled,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except TelegramError as exc:
+            logger.debug("Card story line for @{} not filled: {}", username, exc)
+            return
+        remember_render(target, filled, keyboard)
+
+    spawn(_fill(), name=f"card-story:{username}")
+
+
 async def _render_account_card(
-    username: str, service: Optional[MonitorService] = None
+    username: str,
+    service: Optional[MonitorService] = None,
+    *,
+    story_state: Optional[str] = None,
 ) -> Optional[str]:
     async with get_session() as session:
         account = await crud.get_account(session, username)
@@ -553,6 +686,7 @@ async def _render_account_card(
         untracked_highlights = await crud.get_untracked_highlight_ids(
             session, account.id
         )
+        media_only = await crud.is_media_only(session, account.id)
 
     marker = "🟢 active" if account.active else "⏸ paused"
     last = fmt_timestamp(account.last_checked_at) if account.last_checked_at else "never"
@@ -563,8 +697,10 @@ async def _render_account_card(
         f"<b>@{esc(account.username)}</b>",
         f"Instagram ID: <code>{esc(account.instagram_id or 'unknown')}</code>",
         f"State: {marker}",
-        f"Last check: <code>{last}</code> · {status}",
     ]
+    if media_only:
+        lines.append("Alerts: 🎞 media only (stories, posts &amp; avatar)")
+    lines.append(f"Last check: <code>{last}</code> · {status}")
     if fails:
         lines.append(f"Consecutive failures: <b>{fails}</b>")
 
@@ -628,41 +764,13 @@ async def _render_account_card(
         # stored snapshot's reel_data is only as fresh as the last SUCCESSFUL
         # check — for an account Instagram is currently blocking that can be
         # days old, and seeding from it showed a story that expired long ago.
-        # None here means "couldn't find out", never "no".
+        # A caller that draws the card first passes STORY_CHECKING and fills
+        # the line in afterwards (see _show_account_card).
         if not snapshot.is_private:
-            has_story: Optional[bool] = None
-            is_live = False
-            live = None
-            if service is not None and account.instagram_id:
-                try:
-                    live = await service.instagram.fetch_reel_user(
-                        str(account.instagram_id)
-                    )
-                except Exception:  # pragma: no cover - network failure path
-                    live = None
-            if live is not None:
-                has_story = bool(live.get("has_public_story"))
-                is_live = bool(live.get("is_live"))
-            elif service is not None and service.stories:
-                # Instagram's graphql reel query is 401-blocked from datacenter
-                # IPs (e.g. Render), so `live` is often None in production.
-                # saveinsta is a third-party host and isn't IP-blocked, so it's
-                # the live story oracle when graphql is unavailable: any items
-                # back means an active story.
-                try:
-                    has_story = bool(
-                        await service.stories.fetch_stories(account.username)
-                    )
-                except Exception:  # pragma: no cover - network failure path
-                    has_story = None
-            if is_live:
-                story_state = "🔴 live now"
-            elif has_story is None:
-                story_state = "⚠️ unavailable (live check didn't answer)"
-            elif has_story:
-                story_state = "🎬 has an active story"
-            else:
-                story_state = "⭕ no active story"
+            if story_state is None:
+                story_state = await _live_story_state(
+                    service, account.instagram_id, account.username
+                )
             lines.append(f"Story: {story_state}")
 
     if highlight_catalog:
@@ -717,6 +825,10 @@ def instagram_route() -> str:
         # PROXY_URL wraps the whole session, so it applies to the hop that
         # reaches the worker — not to the worker's own egress to Instagram.
         route += " + outbound proxy"
+    if page_tunnel.tunnel.configured:
+        route += f" · page tunnel {page_tunnel.tunnel.describe()}"
+    elif settings.page_proxy_url:
+        route += " · pages via PAGE_PROXY_URL"
     if settings.home_fetch_token:
         route += f" · home fetcher {home_fetch.broker.describe()}"
     return route
@@ -1085,7 +1197,7 @@ async def _do_add(
         )
         return
 
-    await _reply_or_edit(
+    status_msg = await _reply_or_edit(
         update,
         f"Now monitoring <b>@{esc(account.username)}</b>.\nRunning first check…",
         reply_markup=keyboards.open_account(account.username),
@@ -1093,8 +1205,27 @@ async def _do_add(
 
     service: MonitorService = context.application.bot_data["monitor"]
     try:
-        result = await service.check_username(account.username, notify_unchanged=True)
-        if not result.get("ok") and chat_id is not None:
+        # The first check only lays down the baseline — there is nothing to
+        # compare it against, so "No changes detected" would say nothing. Show
+        # what it read instead: the account card, in place of the note above.
+        result = await service.check_username(account.username, notify_unchanged=False)
+        if result.get("ok"):
+            username = result.get("username", account.username)
+            card = await _render_account_card(
+                username, service, story_state=STORY_CHECKING
+            )
+            if card is not None and status_msg is not None:
+                text = f"✅ <b>Now monitoring</b>\n\n{card}"
+                keyboard = await _actions_keyboard(username, context)
+                await status_msg.edit_text(
+                    text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                    disable_web_page_preview=True,
+                )
+                remember_render(status_msg.message_id, text, keyboard)
+                await _fill_story_line(context, status_msg, username, text, keyboard)
+        elif chat_id is not None:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
@@ -1232,14 +1363,10 @@ async def _send_profile_photo(
             reply_markup=keyboard,
         )
         return
-    quality = (
-        "HD" if result.get("hd")
-        else "standard (320px — anonymous max for this account)"
-    )
     caption = (
         f"<b>@{esc(username)}</b>\n"
         f"SHA256: <code>{esc(result['sha256'])}</code>\n"
-        f"Size: {result['byte_size'] // 1024} KB · {quality}"
+        f"Size: {result['byte_size'] // 1024} KB · {avatar_quality(result)}"
     )
     with open(result["path"], "rb") as f:
         await context.bot.send_document(
@@ -1264,6 +1391,9 @@ async def _actions_keyboard(
     currently running on this account (🎯 start vs 🛑 stop)."""
     async with get_session() as session:
         account = await crud.get_account(session, username)
+        media_only = (
+            account is not None and await crud.is_media_only(session, account.id)
+        )
     if account is None:
         return keyboards.fetch_actions(username)
     stakeout_active = False
@@ -1271,7 +1401,9 @@ async def _actions_keyboard(
         sched = _scheduler(context)
         if sched is not None:
             stakeout_active = sched.stakeout_for(account.id) is not None
-    return keyboards.account_actions(username, account.active, stakeout_active)
+    return keyboards.account_actions(
+        username, account.active, stakeout_active, media_only
+    )
 
 
 async def _begin_stakeout(
@@ -3422,10 +3554,7 @@ async def _handle_account(
 
     if action == "open":
         await _safe_answer(query)
-        service: MonitorService = context.application.bot_data["monitor"]
-        await _safe_edit_text(query, f"⏳ Opening <b>@{esc(username)}</b>…")
-        text = await _render_account_card(username, service)
-        if text is None:
+        if not await _show_account_card(query, context, username):
             # Not monitored — still let the user grab its public story/highlights.
             await _safe_edit_text(
                 query,
@@ -3433,10 +3562,6 @@ async def _handle_account(
                 "its public story or highlights:",
                 reply_markup=keyboards.fetch_actions(username),
             )
-            return
-        await _safe_edit_text(
-            query, text, reply_markup=await _actions_keyboard(username, context)
-        )
         return
 
     if action == "rhythm":
@@ -3471,23 +3596,18 @@ async def _handle_account(
             )
             return
         username = result.get("username", username)
-        text = await _render_account_card(username, service)
         suffix = (
             "\n\n<i>Changes detected ✓</i>"
             if result.get("changed")
             else "\n\n<i>No changes.</i>"
         )
-        if text is None:
+        if not await _show_account_card(query, context, username, suffix=suffix):
             await _safe_edit_text(
                 query,
                 f"<b>@{esc(username)}</b> check done · status "
                 f"{result['status']}{suffix}",
                 reply_markup=keyboards.back_to_list(),
             )
-            return
-        await _safe_edit_text(
-            query, text + suffix, reply_markup=await _actions_keyboard(username, context)
-        )
         return
 
     if action == "history":
@@ -3506,13 +3626,29 @@ async def _handle_account(
             await _safe_answer(query, "Account not found.", show_alert=True)
             return
         await _safe_answer(query, "▶️ Resumed" if new_active else "⏸ Paused")
-        service: MonitorService = context.application.bot_data["monitor"]
-        text = await _render_account_card(username, service)
-        await _safe_edit_text(
+        if not await _show_account_card(query, context, username):
+            await _safe_edit_text(
+                query,
+                f"<b>@{esc(username)}</b> {'resumed' if new_active else 'paused'}.",
+                reply_markup=await _actions_keyboard(username, context),
+            )
+        return
+
+    if action in ("mediaonly", "trackall"):
+        media_only = action == "mediaonly"
+        async with get_session() as session:
+            account = await crud.get_account(session, username)
+            if account is not None:
+                await crud.set_media_only(session, account.id, media_only)
+        if account is None:
+            await _safe_answer(query, "Account not found.", show_alert=True)
+            return
+        await _safe_answer(
             query,
-            text or f"<b>@{esc(username)}</b> {'resumed' if new_active else 'paused'}.",
-            reply_markup=await _actions_keyboard(username, context),
+            "🎞 Alerts: stories, posts & avatar only" if media_only
+            else "📋 Alerts: every profile change",
         )
+        await _show_account_card(query, context, username)
         return
 
     if action == "photo":

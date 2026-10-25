@@ -132,6 +132,7 @@ class FakeBroker:
 
     def __init__(self, *, connected: bool = True) -> None:
         self.connected = connected
+        self.outdated = False
         self.cache: dict[str, home_fetch.PageResult] = {}
         self.reel_cache: dict[str, home_fetch.PageResult] = {}
         self.asked: list[str] = []
@@ -191,6 +192,7 @@ class ScriptedInstagram:
         # This host's page door, as the client reports it: refusing by
         # default, which is the regime these sweeps model.
         self.direct_page_door_failing = True
+        self.direct_page_failures = 2  # its refusals in a row, as logged
         self.in_hand: Optional[dict] = None
         self.in_hand_calls: list[str] = []
 

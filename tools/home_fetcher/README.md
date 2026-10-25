@@ -94,6 +94,28 @@ with every poll, and if it drops to 20% while not charging (the charger fell
 out, the power went) the bot sends you one alert, another at 10%, and a
 "charging again" once it's back on power (`HOME_FETCH_LOW_BATTERY_PERCENT`).
 
+## Updating the worker
+
+The worker sends its build number with every poll, and the bot messages you
+once when the copy on the phone is out of date. The update comes from the
+bot itself (`GET /home-fetch/worker.py`, behind the same token), not from
+GitHub: the phone's line could not reach raw.githubusercontent.com at all.
+
+From version 3 on, in Termux:
+
+    cd ~/home_fetcher && python home_fetcher.py --update && pkill -f home_fetcher.py
+
+An older copy has no `--update`. This works for any version (it reads the
+URL and token from `home_fetcher.env`):
+
+    cd ~/home_fetcher && . ./home_fetcher.env && curl -fsS -H "X-Watcher-Token: $HOME_FETCH_TOKEN" "${WATCHER_URL%/}/home-fetch/worker.py" -o home_fetcher.py.new && mv home_fetcher.py.new home_fetcher.py && pkill -f home_fetcher.py
+
+`start.sh` restarts it within 10 seconds with the new copy, and the first
+line it logs names the version. Version 2 (2026-10-18) picks the profile
+out of the two payload blocks a profile page carries (version 1 sent
+whichever came first, and for some accounts that is always the posts grid,
+so those accounts failed every sweep); version 3 can update itself.
+
 ## Setup on a Windows PC
 
 Same worker, same settings file. Put a shortcut to `home_fetcher.bat` in the
@@ -114,5 +136,6 @@ the bot uses it whenever it happens to be polling during a sweep.
 
 | Call | Auth | Meaning |
 |---|---|---|
-| `GET /home-fetch/jobs?wait=25&batch=8` | `X-Watcher-Token`, `X-Watcher-Worker`, `X-Watcher-Battery`, `X-Watcher-Charging` | Long-poll: `{"jobs": [{"id", "username"}, …]}` (`job` = the first, for old workers) |
+| `GET /home-fetch/worker.py` | `X-Watcher-Token` | The current worker script, for `--update` (version in `X-Watcher-Worker-Version`) |
+| `GET /home-fetch/jobs?wait=25&batch=8` | `X-Watcher-Token`, `X-Watcher-Worker`, `X-Watcher-Version`, `X-Watcher-Battery`, `X-Watcher-Charging` | Long-poll: `{"jobs": [{"id", "username"}, …]}` (`job` = the first, for old workers) |
 | `POST /home-fetch/jobs/<id>` | same, plus `X-IG-Status`, `X-IG-Final-Url`, `X-IG-Payload`, gzip body | Instagram's status and the page's payload (or the head of the page when it has none) |

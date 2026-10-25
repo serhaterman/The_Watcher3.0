@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import random
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -25,11 +26,13 @@ from app.database.models import AccountSnapshot, MonitoredAccount, ProfileMediaH
 from app.database.session import get_session
 from app.monitor.analytics import classify_follower_change, render_follower_anomaly
 from app.monitor.change_detector import (
+    MEDIA_ONLY_FIELDS,
     ChangeSet,
     detect_changes,
+    pic_difference,
     pic_fingerprints_differ,
 )
-from app.monitor import home_fetch
+from app.monitor import home_fetch, page_tunnel
 from app.monitor.instagram import (
     IdProbe,
     InstagramClient,
@@ -40,6 +43,7 @@ from app.monitor.media_hasher import (
     PHASH_PREFIX,
     HashedMedia,
     MediaHasher,
+    image_size,
     pic_asset_id,
 )
 from app.monitor.stories import StoriesClient
@@ -105,6 +109,9 @@ _RETRIABLE_STATUSES = (401, 403, 429, 0)
 # every lookup. Read by the next sweep (one knock instead of a threshold's
 # worth) and by manual checks (skip it), cleared when a knock answers 200.
 _USERNAME_API_DOOR_KEY = "username_api_closed_at"
+# Set while sweeps are reading no counts at all (see _counts_blind_note), so a
+# restart does not announce the same standing condition a second time.
+_COUNTS_BLIND_KEY = "counts_blind_since"
 
 # `record(api_status=...)` default: "not given" is not the same as None. None
 # means the username API was deliberately not asked; not given means the
@@ -129,6 +136,62 @@ def _humanize_seconds(seconds: float) -> str:
     if seconds < 5400:
         return f"{seconds / 60:.0f} min"
     return f"{seconds / 3600:.1f}h"
+
+
+def avatar_quality(result: dict) -> str:
+    """The quality line of a fetched avatar's caption, from its MEASURED size.
+
+    This said "320px" for every non-HD avatar long after 320px stopped being
+    reachable: since the username API was walled (2026-09-05) the fallback is
+    the id route's or the page's 150px variant, and a private account's 150×150
+    went out captioned 320px.
+    """
+    size = result.get("size")
+    if result.get("hd"):
+        return f"HD · {size[0]}×{size[1]}" if size else "HD"
+    measured = f"{size[0]}×{size[1]}" if size else "standard"
+    return f"{measured} — the largest a logged-out request gets for this account"
+
+
+# How long after a picture first appears a reading of an EARLIER upload can
+# still be a cache talking: the phone's results and the page cache live
+# home_fetch.RESULT_TTL_SECONDS (15 minutes), the reel cache 90 s. Twice that,
+# for the margin.
+_STALE_PIC_WINDOW = timedelta(seconds=2 * home_fetch.RESULT_TTL_SECONDS)
+
+
+def _is_stale_pic(
+    current_asset: str,
+    baseline_asset: str,
+    history: list[tuple[str, datetime]],
+    now: datetime,
+) -> bool:
+    """True when a reading's avatar is an upload the account had BEFORE its
+    current one, read while a cache could still be serving that upload.
+
+    Every upload gets a new asset id, so an earlier id coming back is either a
+    cache or the account genuinely returning to it — and the second happens:
+    removing a picture brings back Instagram's default avatar, whose asset id
+    is shared by every account without one, including this account before it
+    first set a picture. So the guard only holds within _STALE_PIC_WINDOW of
+    the current picture's first sighting; after that the earlier id is a real
+    change. (A removal inside the window is reported by the first reading
+    after it, not lost.) `history` is (url, created_at), newest first.
+    """
+    since: Optional[datetime] = None
+    older: list[tuple[str, datetime]] = []
+    for index, (url, created_at) in enumerate(history):
+        if pic_asset_id(url) != baseline_asset:
+            older = history[index:]
+            break
+        since = created_at
+    if since is None or not older:
+        return False
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    if now - since > _STALE_PIC_WINDOW:
+        return False
+    return current_asset in {pic_asset_id(url) for url, _at in older}
 
 
 def _parse_utc(raw: Optional[str]) -> Optional[datetime]:
@@ -471,6 +534,12 @@ class MonitorService:
         # The last finished sweep's shape — counts and which doors served it.
         # Read by /status; None until a sweep has finished this process.
         self.last_sweep: Optional[dict] = None
+        # Whether the owner has been told that sweeps are reading no counts
+        # at all (no page door answering). Said once when it starts and once
+        # when it ends — not every sweep in between. Persisted, and loaded on
+        # the first sweep, so a restart does not say it again.
+        self._counts_blind_announced = False
+        self._counts_blind_loaded = False
         # (account_id, item pk) -> consecutive failed downloads. See
         # _DOWNLOAD_ATTEMPTS.
         self._download_failures: dict[tuple[Optional[int], str], int] = {}
@@ -939,6 +1008,21 @@ class MonitorService:
         # in the window when it closes, so a fixed order made the same tail of
         # accounts absorb every block sweep after sweep.
         random.shuffle(targets)
+        # ...except that the accounts whose last check FAILED go first. They
+        # are the ones with the oldest reading, and the front of a sweep is
+        # where a check has the best odds: the gate has had the whole interval
+        # to cool, the throttle has no blocks on the books yet, and the phone
+        # fetches pages in sweep order, so their pages come back first. The
+        # shuffle above still decides the order within each group, and
+        # `consecutive_failures` is stored, so this holds across a restart.
+        failed_last = {a.id for a in accounts if (a.consecutive_failures or 0) > 0}
+        if failed_last:
+            targets.sort(key=lambda target: target[0] not in failed_last)  # stable
+            logger.info(
+                "Checking first the {} account(s) whose last check failed: {}",
+                len(failed_last),
+                ", ".join(f"@{u}" for aid, u in targets if aid in failed_last),
+            )
         noun = "profile" if len(targets) == 1 else "profiles"
         await self.notifier.send_text(
             f"👁 Sweep started — {len(targets)} {noun} queued."
@@ -1050,11 +1134,24 @@ class MonitorService:
             # — see _staggered_check.)
             throttle.pages_prefetched = True
             self._prefetch_pages(throttle.pending_usernames)
-        elif known_closed:
+        elif known_closed and not self.instagram.direct_page_door_failing:
             logger.info(
                 "This host's page door is answering — the home fetcher stands "
                 "by rather than fetching {} page(s) nobody would read",
                 len(targets),
+            )
+        elif known_closed:
+            # Neither page door is open going in. This line used to say the
+            # host's door was "answering" whenever the phone was offline —
+            # measured 2026-10-20, right after 18 refusals in a row through a
+            # dead page tunnel, which sent the reader looking in the wrong place.
+            logger.warning(
+                "No page door is open going into this sweep — {} ({} "
+                "refusals in a row), and {}. Unless one answers, checks read by "
+                "numeric id only: username, picture and story status, no counts",
+                self._host_page_door_state(),
+                self.instagram.direct_page_failures,
+                self._home_door_state() or "the home fetcher is connected",
             )
         results = await asyncio.gather(
             *(
@@ -1326,6 +1423,9 @@ class MonitorService:
                     f"{deferred} account(s) deferred to avoid making it "
                     "worse. They'll retry shortly / next sweep."
                 )
+            summary += await self._counts_blind_note(
+                checked=checked, with_counts=answered - id_only
+            )
         if backfill_ids:
             async with get_session() as session:
                 accounts_after = await crud.list_accounts(session, only_active=True)
@@ -1382,6 +1482,110 @@ class MonitorService:
         if id_backfill is not None:
             result["id_backfill"] = id_backfill
         return result
+
+    async def _counts_blind_note(self, *, checked: int, with_counts: int) -> str:
+        """A summary line for the moment sweeps stop reading counts — and the
+        moment they start again. "" for every sweep in between.
+
+        With the profile API login-walled, the counts, bio and privacy flag
+        come only from the profile page, and Instagram serves that page only
+        to an IP it trusts. When neither this host nor the home fetcher gets
+        it, every check falls back to the numeric-id route: username, picture
+        and story status, nothing else. The summary still said "17 profiles
+        checked", which read as a healthy sweep — and the owner was left
+        asking why the tool had stopped working. A standing condition, so it
+        is said when it starts and when it ends, not on every sweep.
+        """
+        blind = checked > 0 and with_counts == 0
+        if not self._counts_blind_loaded:
+            try:
+                async with get_session() as session:
+                    raw = await crud.get_setting(session, _COUNTS_BLIND_KEY)
+                self._counts_blind_announced = raw is not None
+                self._counts_blind_loaded = True
+            except Exception as exc:  # unknown: say nothing rather than repeat
+                logger.warning("Could not read the counts-blind flag: {}", exc)
+                return ""
+        if blind and not self._counts_blind_announced:
+            self._counts_blind_announced = True
+            await self._persist_counts_blind(True)
+            home = self._home_door_state()
+            if home is None:
+                home = (
+                    "the home fetcher runs an out-of-date home_fetcher.py"
+                    if home_fetch.broker.outdated
+                    else "the home fetcher's pages carried no profile either"
+                )
+            tunnel = page_tunnel.tunnel
+            here = self._host_page_door_state()
+            if tunnel.configured and not tunnel.up:
+                fix = (
+                    "The tunnel restarts itself, and moves to the next config "
+                    "in page_tunnel.conf when there is one. If it stays down, "
+                    "add a config for another Proton free server to that file, "
+                    "or start the phone's home fetcher."
+                )
+            elif tunnel.configured:
+                fix = (
+                    "Start the phone's home fetcher to get full readings back, "
+                    "or add configs for more Proton free servers to "
+                    "page_tunnel.conf — the tunnel moves to the next one when "
+                    "Instagram keeps refusing its IP."
+                )
+            else:
+                fix = (
+                    "Start the phone's home fetcher, or set up the page "
+                    "tunnel (PAGE_TUNNEL_CONFIG), to get full readings back."
+                )
+            logger.warning(
+                "No counts this sweep: {}, and {}", here, home,
+            )
+            return (
+                f"\n📵 No follower/following counts this sweep — {esc(here)}, "
+                f"and {esc(home)}. Without the page a check can only read the "
+                f"username, picture and story status. {fix}"
+            )
+        if not blind and with_counts > 0 and self._counts_blind_announced:
+            self._counts_blind_announced = False
+            await self._persist_counts_blind(False)
+            return "\n📊 Follower/following counts are being read again."
+        return ""
+
+    def _host_page_door_state(self) -> str:
+        """Why this host's own page door is not serving profiles, as the
+        start of a sentence."""
+        tunnel = page_tunnel.tunnel
+        if tunnel.configured and not tunnel.up:
+            return f"the page tunnel is down ({tunnel.error or 'starting'})"
+        if self.instagram.direct_page_door_failing:
+            return (
+                "Instagram is refusing this server's profile-page requests"
+                + (" — through the page tunnel too" if tunnel.up else "")
+            )
+        return "this server's own page requests got no profile"
+
+    @staticmethod
+    def _home_door_state() -> Optional[str]:
+        """Why the home fetcher cannot serve pages, or None when it is
+        connected."""
+        if not settings.home_fetch_token:
+            return "no home fetcher is set up (HOME_FETCH_TOKEN)"
+        if not home_fetch.broker.connected:
+            return f"the home fetcher is {home_fetch.broker.describe()}"
+        return None
+
+    async def _persist_counts_blind(self, blind: bool) -> None:
+        try:
+            async with get_session() as session:
+                if blind:
+                    await crud.set_setting(
+                        session, _COUNTS_BLIND_KEY,
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+                else:
+                    await crud.delete_setting(session, _COUNTS_BLIND_KEY)
+        except Exception as exc:  # the in-memory flag still stands
+            logger.warning("Could not persist the counts-blind flag: {}", exc)
 
     # ---------- Went-dark radar ----------
 
@@ -1582,6 +1786,9 @@ class MonitorService:
                 skip_username_api=throttle.username_door_closed,
                 instagram_id=instagram_id,
                 paced=True,  # the throttle slot above IS the spacing
+                # The retry rounds come back for this account, so a page the
+                # phone is still delivering is worth that wait.
+                page_can_wait=settings.sweep_retry_rounds > 0,
             )
             # Recorded inside the slot so the next account's pacing — and any
             # cooldown this block just triggered — already accounts for it.
@@ -1652,6 +1859,14 @@ class MonitorService:
 
         Bounded by `sweep_retry_budget_seconds` so a genuine hard block can't
         stretch the sweep indefinitely. Returns how many accounts recovered.
+
+        By id only (`skip_username_api`), a round that recovers nothing ends
+        the pass unless a page door opened during it. The id route's gate
+        refuses per ACCOUNT, not per request — measured 2026-10-20, the same
+        13 accounts refused on all three asks, five minutes of Worker calls
+        for nothing — so asking again what that route just refused, with
+        nothing else changed, only adds to the blocked traffic that keeps it
+        shut. The first round always runs.
         """
         rounds = max(0, settings.sweep_retry_rounds)
         if not rounds:
@@ -1659,6 +1874,7 @@ class MonitorService:
         deadline = time.monotonic() + max(0, settings.sweep_retry_budget_seconds)
         cooldown = _SWEEP_RETRY_COOLDOWN_SECONDS
         recovered = 0
+        doors = self._page_doors_signature()
 
         for round_no in range(1, rounds + 1):
             retriable = [
@@ -1679,9 +1895,12 @@ class MonitorService:
                 round_no, rounds, len(retriable), cooldown,
             )
             await asyncio.sleep(cooldown)
+            round_recovered = 0
+            cut_short = False
             for pos, (idx, aid, uname) in enumerate(retriable):
                 if time.monotonic() >= deadline:
                     logger.info("Retry budget spent mid-round — stopping")
+                    cut_short = True
                     break
                 retry = await self._run_check(
                     aid, uname, thorough=False,
@@ -1690,14 +1909,38 @@ class MonitorService:
                 )
                 if retry.get("ok"):
                     outcomes[idx] = (aid, uname, retry)
-                    recovered += 1
+                    round_recovered += 1
                 if pos < len(retriable) - 1:
                     await asyncio.sleep(random.uniform(*_SWEEP_RETRY_GAP_SECONDS))
+            recovered += round_recovered
             cooldown = min(_SWEEP_RETRY_COOLDOWN_MAX_SECONDS, cooldown * 2)
+            now_doors = self._page_doors_signature()
+            if (
+                skip_username_api and not round_recovered and not cut_short
+                and now_doors == doors
+            ):
+                if round_no < rounds:
+                    logger.info(
+                        "Retry round {} recovered none of {} by id, and no "
+                        "page door opened meanwhile — leaving them to the "
+                        "next sweep rather than asking that route again",
+                        round_no, len(retriable),
+                    )
+                break
+            doors = now_doors
 
         if recovered:
             logger.info("{} account(s) recovered on retry", recovered)
         return recovered
+
+    @staticmethod
+    def _page_doors_signature() -> tuple[int, bool]:
+        """What can make an account refused by id answer on the next round:
+        the page tunnel coming (back) up, or the phone connecting."""
+        return (
+            page_tunnel.tunnel.epoch,
+            bool(settings.home_fetch_token and home_fetch.broker.connected),
+        )
 
     async def _run_check(
         self,
@@ -1709,6 +1952,7 @@ class MonitorService:
         skip_username_api: bool = False,
         instagram_id: Optional[str] = None,
         paced: bool = False,
+        page_can_wait: bool = False,
     ) -> dict:
         """One full check. `thorough` (the default) lets a blocked fetch try
         every colo it can — right for on-demand checks, which are one account
@@ -1733,7 +1977,7 @@ class MonitorService:
                 result = await self._do_check(
                     account_id, username, notify_unchanged,
                     thorough=thorough, skip_username_api=skip_username_api,
-                    instagram_id=instagram_id,
+                    instagram_id=instagram_id, page_can_wait=page_can_wait,
                 )
                 self._log_check_timing(username, result, time.monotonic() - started)
                 return result
@@ -1783,6 +2027,7 @@ class MonitorService:
         thorough: bool = True,
         skip_username_api: bool = False,
         instagram_id: Optional[str] = None,
+        page_can_wait: bool = False,
     ) -> dict:
         logger.info("Checking @{}", username)
         timings: dict[str, float] = {}
@@ -1808,19 +2053,7 @@ class MonitorService:
             )
             timings[f"id/{probe.via}" if probe.via else "id"] = time.monotonic() - clock
             if probe.gone:
-                # The id itself no longer resolves: deactivated, deleted or
-                # banned. Not a rename — a rename keeps the id.
-                gone = ProfileFetchResult(
-                    username=username, http_status=404,
-                    error="the stored Instagram ID no longer resolves",
-                )
-                result = await self._handle_failure(
-                    account_id, username, gone, id_probe=probe
-                )
-                result["id_status"] = probe.status
-                result["api_status"] = None
-                result["timings"] = timings
-                return result
+                return await self._id_gone(account_id, username, probe, timings)
             if probe.answered and probe.username and probe.username != username:
                 username = await self._apply_rename(
                     account_id, username, probe.username
@@ -1846,6 +2079,45 @@ class MonitorService:
         )
         timings["username side"] = time.monotonic() - clock
         timings.update(fetch.timings)
+
+        if (
+            not fetch.success
+            and probe is not None
+            and probe.via == "cache-miss"
+            and page_can_wait
+            and fetch.page_pending
+        ):
+            # Late, not refused: the phone has this page in hand. An id-only
+            # reading now would count as an answer and the retry round would
+            # never come back for the page — measured 2026-10-18, two
+            # accounts settled for username + picture while their full pages
+            # landed a minute later. Fail it for now; the round reads it.
+            logger.info(
+                "@{}: the home fetcher has this page in hand but has not "
+                "delivered it yet — leaving it to the retry round rather than "
+                "settling for an id-only reading", username,
+            )
+        elif not fetch.success and probe is not None and probe.via == "cache-miss":
+            # The sweep skipped the live id route because the phone's page was
+            # going to answer — and the page did not. Ask by id now, through
+            # the Worker only (the phone already had its turn). Without this a
+            # renamed or deleted account failed every sweep in silence: its
+            # old username's page is an error shell, and the one route that
+            # can tell "renamed" from "gone" from "bad page" was never asked.
+            # One Worker call, and only for an account that has otherwise
+            # failed.
+            clock = time.monotonic()
+            probe = await self.instagram.probe_by_id(
+                instagram_id, ask_phone=False
+            )
+            timings[f"id/{probe.via or 'live'}"] = time.monotonic() - clock
+            if probe.gone:
+                return await self._id_gone(account_id, username, probe, timings)
+            if probe.answered and probe.username and probe.username != username:
+                username = await self._apply_rename(
+                    account_id, username, probe.username
+                )
+
         id_status = probe.status if probe is not None else None
         if fetch.success:
             clock = time.monotonic()
@@ -1899,6 +2171,24 @@ class MonitorService:
         )
         result["id_status"] = id_status
         result["api_status"] = fetch.api_status
+        result["timings"] = timings
+        return result
+
+    async def _id_gone(
+        self, account_id: int, username: str, probe: IdProbe,
+        timings: dict[str, float],
+    ) -> dict:
+        """The stored id itself no longer resolves: deactivated, deleted or
+        banned. Not a rename — a rename keeps the id."""
+        gone = ProfileFetchResult(
+            username=username, http_status=404,
+            error="the stored Instagram ID no longer resolves",
+        )
+        result = await self._handle_failure(
+            account_id, username, gone, id_probe=probe
+        )
+        result["id_status"] = probe.status
+        result["api_status"] = None
         result["timings"] = timings
         return result
 
@@ -2139,16 +2429,35 @@ class MonitorService:
                     session, account_id
                 )
         current_asset = pic_asset_id(pic_url)
+        baseline_asset = pic_asset_id(baseline_url)
         pic_unchanged = bool(
             pic_url
             and current_asset
             and baseline_hash
             and baseline_hash.startswith(PHASH_PREFIX)
-            and current_asset == pic_asset_id(baseline_url)
+            and current_asset == baseline_asset
         )
+        # A reading can also be OLDER than the baseline: a door answering from
+        # a cache after a fresh reading saw the new picture. Downloading it
+        # compared the old picture with the new baseline and announced the old
+        # photo as a change — then the next fresh reading announced the new one
+        # again. See _is_stale_pic for when an earlier upload id is stale.
+        pic_stale = False
+        if pic_url and current_asset and baseline_asset and current_asset != baseline_asset:
+            async with get_session() as session:
+                history = await crud.get_pic_history(session, account_id)
+            pic_stale = _is_stale_pic(
+                current_asset, baseline_asset, history, datetime.now(timezone.utc)
+            )
+            if pic_stale:
+                logger.info(
+                    "Avatar for @{} is an earlier upload ({}) than the stored one "
+                    "({}) — a stale reading, not a change",
+                    username, current_asset, baseline_asset,
+                )
 
         hashed: Optional[HashedMedia] = None
-        if pic_url and not pic_unchanged:
+        if pic_url and not pic_unchanged and not pic_stale:
             hashed = await self.hasher.hash_url(pic_url, username)
         elif pic_unchanged:
             logger.debug(
@@ -2165,6 +2474,7 @@ class MonitorService:
         # above already has its fingerprint and must not trigger the fallback.
         if (
             not pic_unchanged
+            and not pic_stale
             and (hashed is None or hashed.phash is None)
             and pic_url
             and self.stories is not None
@@ -2411,6 +2721,12 @@ class MonitorService:
                 snapshot,
                 new_pic_hash=new_pic_hash,
                 observed_fields=set(parsed) if fetch.partial else None,
+                # The newest fingerprint from any door: the same row the
+                # confirmation pass above compared against.
+                pic_baseline=(
+                    (last_known.profile_pic_hash, last_known.profile_pic_url)
+                    if last_known is not None else None
+                ),
             )
             # The rename (if any) was announced by _apply_rename above; drop
             # the diff's own copy so one rename is one message whichever
@@ -2431,9 +2747,22 @@ class MonitorService:
                 # both bloated the row and wiped the stored story/highlight
                 # state. The slim form keeps reel_data current instead.
                 previous.raw_response = slim_raw or None
-                previous.profile_pic_url = stored_pic_url
-                previous.profile_pic_hash = stored_pic_hash
+                if not pic_stale:
+                    # A stale reading's door row keeps the earlier upload it
+                    # last saw: writing the current one over it erased the
+                    # only record of that upload, and the next stale reading
+                    # of it was no longer recognised.
+                    previous.profile_pic_url = stored_pic_url
+                    previous.profile_pic_hash = stored_pic_hash
                 previous.error = None
+                # The picture's baseline is the newest row from ANY door (see
+                # detect_changes' pic_baseline), which may be another door's.
+                # Left behind, it kept an old-format fingerprint after the
+                # upgrade and every sweep from this door re-downloaded the
+                # avatar to compare against it.
+                if last_known is not None and last_known is not previous:
+                    last_known.profile_pic_url = stored_pic_url
+                    last_known.profile_pic_hash = stored_pic_hash
                 logger.debug(
                     "@{} - no changes detected; refreshed latest 200 response",
                     username,
@@ -2477,7 +2806,9 @@ class MonitorService:
             account_id,
             username,
             changeset,
-            previous_snapshot_id=previous.id if previous else None,
+            # "Baseline recorded" means no reading at all, from any door: a
+            # door's first reading can still report a picture change.
+            previous_snapshot_id=last_known.id if last_known else None,
             new_pic_path=hashed.local_path if hashed else None,
             notify_unchanged=notify_unchanged,
         )
@@ -2543,10 +2874,28 @@ class MonitorService:
         notify_unchanged: bool,
     ) -> None:
         thread_id = await self.topic_for(account_id, username)
+        # A media-only account alerts on its posts and avatar alone here (its
+        # stories go out from the story phase as usual); the rest of the
+        # profile is still read and stored, just not sent or logged. A copy,
+        # not an edit: the caller still reads the full change set (went_public,
+        # the new-post count).
+        muted = 0
+        if changeset.changes:
+            async with get_session() as session:
+                media_only = await crud.is_media_only(session, account_id)
+            if media_only:
+                kept = [c for c in changeset.changes if c.field in MEDIA_ONLY_FIELDS]
+                muted = len(changeset.changes) - len(kept)
+                changeset = replace(changeset, changes=kept)
         if not changeset.has_changes:
             if notify_unchanged:
+                headline = (
+                    f"No changes to posts or avatar ({muted} profile "
+                    f"change{'' if muted == 1 else 's'} muted: media only)."
+                    if muted else "No changes detected."
+                )
                 await self.notifier.send_text(
-                    f"<b>@{username}</b>\nNo changes detected.\n"
+                    f"<b>@{username}</b>\n{headline}\n"
                     f"Checked at {fmt_timestamp(datetime.now(timezone.utc))}",
                     message_thread_id=thread_id,
                 )
@@ -2603,11 +2952,12 @@ class MonitorService:
 
         # Profile picture sent as a document to preserve full quality
         if changeset.profile_pic_changed and new_pic_path is not None:
-            caption = (
-                f"<b>@{username}</b> changed profile picture\n"
-                f"Old fingerprint: <code>{changeset.old_pic_hash}</code>\n"
-                f"New fingerprint: <code>{changeset.new_pic_hash}</code>"
-            )
+            difference = pic_difference(changeset.old_pic_hash, changeset.new_pic_hash)
+            caption = f"<b>@{username}</b> changed profile picture"
+            if difference is not None:
+                # One version of one picture stays under 2 gray levels; a
+                # different picture is typically 10+.
+                caption += f"\nDifference from the last one: {difference:.1f}"
             ok = await self.notifier.send_document(
                 new_pic_path, caption=caption, message_thread_id=thread_id
             )
@@ -2710,6 +3060,19 @@ class MonitorService:
             elif isinstance(r, Exception):
                 logger.debug("Highlight item fetch failed for @{}: {}", username, r)
         return items
+
+    def _media_unavailable(self, since: float) -> str:
+        """The error for a download saveinsta sent nothing for, `since` being
+        when the download started. When saveinsta said why, pass its words on;
+        guessing at a rate limit hid that it had stopped serving highlights
+        ("Video is private." for every public account)."""
+        reason = self.stories.refusal_since(since) if self.stories else None
+        if reason is None:
+            return _DOWNLOAD_UNAVAILABLE_MSG
+        return (
+            f"saveinsta, the anonymous media source, refused it: “{reason}” "
+            "Highlight names and story status still work."
+        )
 
     @staticmethod
     def _diff_highlight_catalog(
@@ -3375,6 +3738,10 @@ class MonitorService:
                 caption = f"🖼 <b>@{esc(username)}</b> — new post"
             else:
                 caption = f"📖 <b>@{esc(username)}</b> — new story"
+            if item.media_type != "video":
+                size = await asyncio.to_thread(image_size, path)
+                if size:
+                    caption += f" · {size[0]}×{size[1]}"
 
             if item.media_type == "video":
                 ok = await self.notifier.send_video(
@@ -3866,6 +4233,7 @@ class MonitorService:
                 has_story = None
 
         # Anonymous media fetch (no login) via saveinsta.to.
+        since = time.monotonic()
         try:
             stories = await self.stories.fetch_stories(username)
         except Exception as exc:  # pragma: no cover - network failure path
@@ -3884,7 +4252,7 @@ class MonitorService:
             # Genuinely no active story right now.
             return {"ok": True, "count": 0, "error": None}
         # Either there IS a story we can't fetch anonymously, or status unknown.
-        return {"ok": False, "count": 0, "error": _DOWNLOAD_UNAVAILABLE_MSG}
+        return {"ok": False, "count": 0, "error": self._media_unavailable(since)}
 
     async def fetch_and_send_story_url(
         self, username: str, story_url: str, *, pk: Optional[str] = None
@@ -3906,6 +4274,7 @@ class MonitorService:
             account = await crud.get_account(session, username)
         account_id = account.id if account else None
 
+        since = time.monotonic()
         try:
             items = await self.stories.fetch_story_by_url(story_url)
         except Exception as exc:  # pragma: no cover - network failure path
@@ -3922,7 +4291,7 @@ class MonitorService:
                 items = matched
 
         if not items:
-            return {"ok": False, "count": 0, "error": _DOWNLOAD_UNAVAILABLE_MSG}
+            return {"ok": False, "count": 0, "error": self._media_unavailable(since)}
 
         async with self.download_scope():
             sent = await self._deliver_story_items(
@@ -4005,6 +4374,7 @@ class MonitorService:
 
         highlight_id, title = items[index]
         # Anonymous media fetch (no login) via saveinsta.to.
+        since = time.monotonic()
         try:
             story_items = await self.stories.fetch_highlight_items(
                 username, highlight_id, title
@@ -4017,7 +4387,10 @@ class MonitorService:
             story_items = []
 
         if not story_items:
-            return {"ok": False, "count": 0, "title": title, "error": _DOWNLOAD_UNAVAILABLE_MSG}
+            return {
+                "ok": False, "count": 0, "title": title,
+                "error": self._media_unavailable(since),
+            }
 
         async with self.download_scope():
             sent = await self._deliver_story_items(
@@ -4049,13 +4422,14 @@ class MonitorService:
 
         catalog = {hid: title for hid, title in items}
         async with self.download_scope():
+            since = time.monotonic()
             story_items = await self._gather_highlight_items(
                 username, catalog, cancellable=True
             )
             if not story_items:
                 return {
                     "ok": False, "count": 0, "reels": len(items),
-                    "error": _DOWNLOAD_UNAVAILABLE_MSG,
+                    "error": self._media_unavailable(since),
                 }
             sent = await self._deliver_story_items(
                 account_id, username, story_items, set(),
@@ -4088,13 +4462,14 @@ class MonitorService:
         account_id = account.id if account else None
 
         async with self.download_scope():
+            since = time.monotonic()
             story_items = await self._gather_highlight_items(
                 username, catalog, cancellable=True
             )
             if not story_items:
                 return {
                     "ok": False, "count": 0, "reels": len(catalog),
-                    "error": _DOWNLOAD_UNAVAILABLE_MSG,
+                    "error": self._media_unavailable(since),
                 }
             sent = await self._deliver_story_items(
                 account_id, username, story_items, set(), cancellable=True
@@ -4181,9 +4556,8 @@ class MonitorService:
         result = await self.fetch_profile_picture(username)
         if not result.get("ok"):
             return {"ok": False, "hd": False, "error": result.get("error")}
-        quality = "HD" if result.get("hd") else "320px (anonymous max)"
         caption = (
-            f"👤 <b>@{esc(username)}</b> — profile picture · {quality}\n"
+            f"👤 <b>@{esc(username)}</b> — profile picture · {avatar_quality(result)}\n"
             f"SHA256: <code>{esc(result['sha256'])}</code>"
         )
         ok = await self.notifier.send_document(result["path"], caption=caption)
@@ -4355,9 +4729,11 @@ class MonitorService:
         """Download the CURRENT profile picture at the best available quality.
 
         Login-free, works for any username. Prefers the HD (up to 1080px) avatar
-        from saveinsta; falls back to the web profile_pic_url_hd (320px, the
-        anonymous ceiling for accounts saveinsta can't reach, e.g. private ones).
-        Returns {"ok", "path", "sha256", "byte_size", "hd", "error"}.
+        from saveinsta; falls back to whatever avatar the profile fetch carries
+        for accounts saveinsta can't reach, e.g. private ones: 320px while the
+        username API answered, the 150px variant since it was walled.
+        Returns {"ok", "path", "sha256", "byte_size", "size", "hd", "error"};
+        `size` is the measured (width, height), None if unreadable.
         """
         username = username.strip().lstrip("@").lower()
 
@@ -4379,14 +4755,14 @@ class MonitorService:
 
         if hashed is None:
             # No HD avatar (private account / saveinsta down) or its download
-            # failed mid-flight — fall back to the web profile_pic_url_hd (320px).
+            # failed mid-flight — fall back to the profile fetch's avatar.
             fetch = await self.instagram.fetch_profile(username)
             if not fetch.success or not fetch.parsed:
                 return {
                     "ok": False, "path": None,
                     "error": fetch.error or f"HTTP {fetch.http_status}",
                 }
-            web_url = fetch.parsed.get("profile_pic_url")  # already hd(320) or 150
+            web_url = fetch.parsed.get("profile_pic_url")  # 320 via the API, else 150
             if not web_url:
                 return {"ok": False, "path": None, "error": "No profile picture available"}
             hd_url = None  # what we deliver below is the web fallback, not HD
@@ -4400,6 +4776,7 @@ class MonitorService:
             "path": hashed.local_path,
             "sha256": hashed.sha256,
             "byte_size": hashed.byte_size,
+            "size": await asyncio.to_thread(image_size, hashed.local_path),
             "hd": bool(hd_url),
             "error": None,
         }

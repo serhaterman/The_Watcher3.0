@@ -36,6 +36,8 @@ Setup — two values, in a file named ``home_fetcher.env`` next to this script
 
     python home_fetcher.py --new-token     prints a fresh random token to use
     python home_fetcher.py                 runs the worker
+    python home_fetcher.py --update        replaces this file with the copy the
+                                           bot serves (no GitHub needed)
 
 Only Python 3.9+ is needed. curl_cffi (``pip install curl_cffi``) is used
 when installed — it impersonates Chrome down to the TLS handshake — but the
@@ -109,6 +111,20 @@ SOFT_BLOCK_PAUSE_SECONDS = 60.0
 # Uploads run here so a slow link never holds up the next fetch or poll.
 UPLOAD_THREADS = 2
 UPLOAD_TIMEOUT = 90
+# A kept connection left unused this long is reopened before the next request.
+# The upload threads sit idle for the whole gap between sweeps, and a phone's
+# VPN or carrier NAT forgets an idle connection without telling either end:
+# the next upload went out into nothing and waited the full UPLOAD_TIMEOUT for
+# a reply. Measured 2026-10-18: pages fetched in ~2 s each reached the bot
+# 111 s after pickup, all at once, as both upload threads came back from that
+# timeout. Within a sweep the uploads are seconds apart, so this only costs
+# one fresh connection per thread per sweep.
+IDLE_RECONNECT_SECONDS = 20.0
+# What this build knows, sent with every request so the bot can tell an
+# out-of-date copy apart. 2 = picks the profile block out of the two
+# `xig_user_by_username` blocks a page carries; 3 = can update itself from
+# the bot (--update).
+WORKER_VERSION = 3
 # When the page carries no payload (login wall, 404, block page) the bot only
 # needs enough of it to say what it was.
 NO_PAYLOAD_BODY_LIMIT = 64 * 1024
@@ -278,6 +294,10 @@ def _fetch_with_stdlib(url: str, headers: dict) -> tuple[int, bytes, str]:
 
 _PAYLOAD_KEY = '"xig_user_by_username":'
 _OBJECT_LIMIT = 200_000
+# The page carries the key twice (see extract_payload); the cap only bounds a
+# malformed page.
+_MAX_OCCURRENCES = 8
+_PROFILE_MARKERS = ("follower_count", "following_count", "is_private")
 
 
 def _extract_object(text: str, start: int) -> Optional[str]:
@@ -313,15 +333,29 @@ def _extract_object(text: str, start: int) -> Optional[str]:
 def extract_payload(body: bytes) -> Optional[bytes]:
     """The profile payload out of the page, wrapped so the bot's parser reads
     it exactly as it reads the page — a few KB instead of 700 KB. None when
-    the page carries none (login wall, 404, block page)."""
+    the page carries none (login wall, 404, block page).
+
+    The key appears twice: once for the profile, once for the posts grid
+    (pk, id and the timeline only), in either order. Taking the first one
+    sent the bot the grid block for some accounts every sweep (measured
+    2026-10-18), so this picks the block that has the profile's fields."""
     text = body.decode("utf-8", "replace")
-    at = text.find(_PAYLOAD_KEY)
-    if at < 0:
-        return None
-    raw = _extract_object(text, at + len(_PAYLOAD_KEY))
-    if raw is None:
-        return None
-    return ('{"data":{' + _PAYLOAD_KEY + raw + "}}").encode("utf-8")
+    start = 0
+    for _ in range(_MAX_OCCURRENCES):
+        at = text.find(_PAYLOAD_KEY, start)
+        if at < 0:
+            return None
+        start = at + len(_PAYLOAD_KEY)
+        raw = _extract_object(text, start)
+        if raw is None:
+            continue
+        try:
+            block = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(block, dict) and any(k in block for k in _PROFILE_MARKERS):
+            return ('{"data":{' + _PAYLOAD_KEY + raw + "}}").encode("utf-8")
+    return None
 
 
 # ------------------------------------------------------------- the device
@@ -390,6 +424,7 @@ class BotLink:
         self._token = token
         self._worker = worker
         self._conn: Optional[http.client.HTTPConnection] = None
+        self._last_used = 0.0
         self.connects = 0
         self.last_connect_seconds = 0.0
 
@@ -422,9 +457,12 @@ class BotLink:
         all_headers = {
             "X-Watcher-Token": self._token,
             "X-Watcher-Worker": self._worker,
+            "X-Watcher-Version": str(WORKER_VERSION),
             "Connection": "keep-alive",
             **(headers or {}),
         }
+        if self._conn is not None and time.monotonic() - self._last_used > IDLE_RECONNECT_SECONDS:
+            self.close()  # likely forgotten by a NAT on the way — see IDLE_RECONNECT_SECONDS
         last_error: Optional[Exception] = None
         for attempt in (1, 2):
             conn = self._conn
@@ -437,6 +475,7 @@ class BotLink:
                              body=body if method == "POST" else None, headers=all_headers)
                 response = conn.getresponse()
                 data = response.read()
+                self._last_used = time.monotonic()
                 if response.getheader("Connection", "").lower() == "close":
                     self.close()
                 return response.status, data
@@ -528,7 +567,7 @@ def _fetch_loop(url: str, token: str, worker: str,
 
 
 def run(url: str, token: str, worker: str) -> int:
-    _log(f"polling {url} as '{worker}'  (engine: {ENGINE})")
+    _log(f"polling {url} as '{worker}'  (engine: {ENGINE}, version {WORKER_VERSION})")
     percent, charging = read_battery()
     if percent is not None:
         state = "charging" if charging else "not charging" if charging is not None else "unknown"
@@ -603,6 +642,53 @@ def run(url: str, token: str, worker: str) -> int:
         _log(f"{len(jobs)} job(s) taken" + (f" ({depth} waiting to fetch)" if depth > 1 else ""))
 
 
+_VERSION_LINE = re.compile(r"^WORKER_VERSION = (\d+)", re.MULTILINE)
+
+
+def self_update(url: str, token: str, worker: str, target: Optional[Path] = None) -> int:
+    """Replace this script with the copy the bot serves.
+
+    From the bot, not GitHub: the phone could not reach
+    raw.githubusercontent.com at all (2026-10-18, a two-minute connect
+    timeout), while the bot is the one server it talks to every few seconds.
+    The new copy is checked before it lands — it must compile and be the
+    worker script — and written beside this one, then moved over it in one
+    step, so a failed or partial download never leaves a broken worker.
+    The running worker keeps the old code until it is restarted."""
+    target = target or Path(__file__).resolve()
+    link = BotLink(url, token, worker)
+    try:
+        status, body = link.request("GET", "/home-fetch/worker.py", timeout=60)
+    except (http.client.HTTPException, OSError) as exc:
+        _log(f"update failed - the bot is unreachable ({exc})")
+        return 1
+    finally:
+        link.close()
+    if status != 200:
+        hint = " (check HOME_FETCH_TOKEN)" if status == 401 else ""
+        _log(f"update failed - the bot answered HTTP {status}{hint}")
+        return 1
+    try:
+        source = body.decode("utf-8")
+        compile(source, str(target), "exec")
+    except (UnicodeDecodeError, SyntaxError) as exc:
+        _log(f"update failed - what the bot sent does not compile ({exc})")
+        return 1
+    match = _VERSION_LINE.search(source)
+    if match is None:
+        _log("update failed - what the bot sent is not the worker script")
+        return 1
+    staged = target.with_name(target.name + ".new")
+    staged.write_bytes(body)
+    os.replace(staged, target)
+    _log(
+        f"updated {target.name}: version {WORKER_VERSION} -> {match.group(1)}. "
+        "Restart it to run the new copy (start.sh does so within 10 s of "
+        "`pkill -f home_fetcher.py`)."
+    )
+    return 0
+
+
 def main() -> int:
     if "--new-token" in sys.argv:
         print(secrets.token_urlsafe(32))
@@ -614,6 +700,8 @@ def main() -> int:
             f"{ENV_FILE.name} next to this script or in the environment"
         )
         return 2
+    if "--update" in sys.argv:
+        return self_update(url, token, worker)
     try:
         return run(url, token, worker)
     except KeyboardInterrupt:

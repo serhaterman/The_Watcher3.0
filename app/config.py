@@ -67,6 +67,17 @@ class Settings(BaseSettings):
     home_fetch_battery_alerts: str = Field(
         default="50,20,10,5", alias="HOME_FETCH_BATTERY_ALERTS"
     )
+    # The page tunnel (app/monitor/page_tunnel.py): this host's profile-page
+    # requests leave through a WireGuard VPN instead of this host's own IP,
+    # which Instagram sends to its login page. Either the config text itself
+    # or a path to the .conf file; unset, a Render Secret File named
+    # page_tunnel.conf is used when present. Only the page requests use it.
+    # Several configs one after another (each from its own [Interface]) are
+    # a failover list: the next takes over when one stops answering.
+    page_tunnel_config: Optional[str] = Field(default=None, alias="PAGE_TUNNEL_CONFIG")
+    # Or a plain proxy for the page requests only (http://, socks5h://) — a
+    # residential proxy, say. Used when no tunnel is configured.
+    page_proxy_url: Optional[str] = Field(default=None, alias="PAGE_PROXY_URL")
 
     # How many times a 401/403 from the Cloudflare Worker is re-asked. One
     # worker call is already 6 upstream attempts with rotating UAs and hosts —
@@ -161,6 +172,14 @@ class Settings(BaseSettings):
     # to false to keep the old baseline-only behavior.
     auto_grab_on_public: bool = Field(default=True, alias="AUTO_GRAB_ON_PUBLIC")
 
+    # Deliver story/post/highlight PHOTOS as files (sendDocument) rather than
+    # Telegram photos. Telegram re-encodes everything sent as a photo, so the
+    # inline picture in the chat is Telegram's lossy JPEG of the download, not
+    # the download; a file arrives byte-for-byte, still with a preview, and
+    # opens in the same viewer. false = inline photos (recompressed). Videos
+    # and profile pictures are unaffected (the latter always go as files).
+    photos_as_files: bool = Field(default=True, alias="PHOTOS_AS_FILES")
+
     # How often to LIST a public account's grid when the post count is not
     # readable, so a new post is still found. The count is normally the cheap
     # trigger — it rises, and only then is the grid listed — but the profile
@@ -243,6 +262,17 @@ class Settings(BaseSettings):
     # by default; a FAILING one always logs, whatever this says. Set true when
     # the question is whether the health checker is running at all.
     log_health_checks: bool = Field(default=False, alias="LOG_HEALTH_CHECKS")
+
+    # Render's free web service sleeps after 15 minutes without an inbound
+    # request, and the next tap then waits about a minute for it to boot (the
+    # sweeps stop while it sleeps, too). Render's own health checks do not
+    # count; a request through its public edge does. So the app asks its own
+    # public /health this often: every 5 minutes, so even a ping that fails
+    # leaves the next one inside the 15. Render sets RENDER_EXTERNAL_URL
+    # itself; with no URL, or 0 here, nothing is pinged. Always-on fits the
+    # free plan's 750 instance hours a month for one service.
+    keep_awake_seconds: int = Field(default=300, alias="KEEP_AWAKE_SECONDS")
+    render_external_url: Optional[str] = Field(default=None, alias="RENDER_EXTERNAL_URL")
 
     # Optional proxy (single URL applied to both http and https)
     proxy_url: Optional[str] = Field(default=None, alias="PROXY_URL")

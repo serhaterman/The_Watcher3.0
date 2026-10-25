@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -23,6 +24,7 @@ from app.utils.logger import logger
 SWEEP_JOB_ID = "watcher-sweep"
 CLEANUP_JOB_ID = "watcher-cleanup"
 DIGEST_JOB_ID = "watcher-digest"
+KEEP_AWAKE_JOB_ID = "watcher-keep-awake"
 SETTING_INTERVAL = "check_interval_seconds"
 SETTING_LAST_SWEEP_AT = "last_sweep_at"
 SETTING_STAKEOUTS = "active_stakeouts"
@@ -188,6 +190,18 @@ class WatcherScheduler:
             coalesce=True,
             misfire_grace_time=3600,
         )
+        if settings.render_external_url and settings.keep_awake_seconds > 0:
+            self.scheduler.add_job(
+                self._keep_awake,
+                trigger=IntervalTrigger(seconds=settings.keep_awake_seconds),
+                id=KEEP_AWAKE_JOB_ID,
+                max_instances=1,
+                coalesce=True,
+                # APScheduler's default grace is 1 s: a tick that comes due
+                # while a sweep holds the loop a moment longer is DROPPED, and
+                # one lost ping is long enough for Render to sleep.
+                misfire_grace_time=settings.keep_awake_seconds,
+            )
         self.scheduler.start()
         logger.info(
             "Scheduler started — interval={}s jitter=±{}s first run={}",
@@ -454,6 +468,21 @@ class WatcherScheduler:
         finally:
             self._sweep_in_flight = False
             self._emit_state("running")
+
+    async def _keep_awake(self) -> None:
+        """One request to our own public /health, so Render sees inbound
+        traffic and never puts the bot to sleep (see keep_awake_seconds)."""
+        url = settings.render_external_url.rstrip("/") + "/health"
+        try:
+            # trust_env=False: HTTP(S)_PROXY is the Instagram proxy. Our own
+            # URL must not go through it, and a socks5:// one makes httpx
+            # raise ImportError (no socksio) before any request is made.
+            async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
+                response = await client.get(url)
+            if response.status_code != 200:
+                logger.warning("Keep-awake ping {} answered HTTP {}", url, response.status_code)
+        except Exception as exc:
+            logger.warning("Keep-awake ping {} failed: {}", url, exc)
 
     async def _cleanup_wrapper(self) -> None:
         snap_days = settings.snapshot_retention_days

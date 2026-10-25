@@ -397,6 +397,26 @@ async def get_latest_pic_baseline(
     return (row[0], row[1]) if row else (None, None)
 
 
+async def get_pic_history(
+    session: AsyncSession, account_id: int, *, limit: int = 200
+) -> list[tuple[str, datetime]]:
+    """(avatar URL, created_at) of the successful snapshots, newest first —
+    the newest being the pic baseline. For recognising a reading that serves
+    an older upload than the baseline. `cleanup_old_snapshots` keeps 200."""
+    stmt = (
+        select(AccountSnapshot.profile_pic_url, AccountSnapshot.created_at)
+        .where(
+            AccountSnapshot.account_id == account_id,
+            AccountSnapshot.http_status == 200,
+            AccountSnapshot.profile_pic_url.is_not(None),
+        )
+        .order_by(desc(AccountSnapshot.created_at), desc(AccountSnapshot.id))
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return [(row[0], row[1]) for row in result.all()]
+
+
 async def insert_snapshot(
     session: AsyncSession, snapshot: AccountSnapshot
 ) -> AccountSnapshot:
@@ -871,6 +891,26 @@ async def set_account_topic(
     session: AsyncSession, account_id: int, thread_id: int
 ) -> None:
     await set_setting(session, _topic_key(account_id), str(thread_id))
+
+
+# ---------- Per-account media-only alerts (stored in app_settings) ----------
+
+def _media_only_key(account_id: int) -> str:
+    return f"media_only:{account_id}"
+
+
+async def is_media_only(session: AsyncSession, account_id: int) -> bool:
+    """True when the account alerts only on its stories, posts and avatar."""
+    return await get_setting(session, _media_only_key(account_id)) == "1"
+
+
+async def set_media_only(
+    session: AsyncSession, account_id: int, media_only: bool
+) -> None:
+    if media_only:
+        await set_setting(session, _media_only_key(account_id), "1")
+    else:
+        await delete_setting(session, _media_only_key(account_id))
 
 
 # ---------- Data retention ----------
