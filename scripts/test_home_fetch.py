@@ -440,11 +440,65 @@ async def test_endpoints() -> None:
         home_fetch.broker = old_broker
 
 
+async def test_a_job_taken_and_never_answered_is_let_go() -> None:
+    """The phone took a job and never delivered it — its fetch or upload
+    failed, or it lost the network mid-batch. Jobs only ever expired on their
+    way OUT of the queue, so this one stayed in flight for good, and every
+    later request for that account found it there and queued nothing: the
+    home door stayed shut for the account until the bot restarted."""
+    from app.monitor import home_fetch
+
+    broker = HomeFetchBroker()
+
+    async def taker():
+        return await broker.next_job(wait=5.0, worker="phone")  # never answers
+
+    task = asyncio.create_task(taker())
+    await asyncio.sleep(0.02)
+    first = await broker.request_page("dropped", timeout=0.2)
+    taken = await task
+    expect("the first request went unanswered", first is None and len(taken) == 1,
+           repr((first, taken)))
+    # Long enough later that no worker is still busy with it.
+    age = home_fetch.HANDED_MAX_AGE_SECONDS + 1
+    taken[0].handed -= age
+    taken[0].created -= age
+
+    async def answerer():
+        jobs = await broker.next_job(wait=2.5, worker="phone")
+        for job in jobs:
+            broker.deliver(job.id, PageResult(200, "<html>fresh</html>"))
+        return jobs
+
+    task = asyncio.create_task(answerer())
+    await asyncio.sleep(0.02)
+    second = await broker.request_page("dropped", timeout=2.0)
+    fresh = await task
+    expect("a new job is queued and handed out",
+           len(fresh) == 1 and fresh[0].id != taken[0].id, repr(fresh))
+    expect("and its answer reaches the check",
+           second is not None and second.body == "<html>fresh</html>", repr(second))
+    expect("the abandoned job's late answer is refused",
+           not broker.deliver(taken[0].id, PageResult(200, "late")))
+
+    # The sweep's up-front prefetch, too, re-queues an abandoned job.
+    task = asyncio.create_task(taker())
+    await asyncio.sleep(0.02)
+    broker.prefetch(["dropped-too"])
+    handed = await task
+    for job in handed:
+        job.handed -= age
+        job.created -= age
+    expect("a prefetch queues the account again",
+           len(handed) == 1 and broker.prefetch(["dropped-too"]) == 1, repr(handed))
+
+
 async def main() -> int:
     await test_not_connected_answers_at_once()
     await test_round_trip()
     await test_a_silent_worker_costs_only_the_timeout()
     await test_an_abandoned_job_is_not_handed_out()
+    await test_a_job_taken_and_never_answered_is_let_go()
     await test_prefetch_batches_and_caches()
     await test_reel_jobs_go_only_to_a_worker_that_can_fetch_them()
     test_battery_alerts_once_per_rung()
