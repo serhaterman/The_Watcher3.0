@@ -884,6 +884,7 @@ keeps the real Chrome fingerprint. The Worker remains the free default.
 |---|---|
 | `/start` or `/menu` | Open the main panel |
 | `/add @username` | Start monitoring an account (runs first check immediately) |
+| `/addmedia @username` | Same, alerting only on stories, posts and the avatar (media-only); switches an account already monitored |
 | `/remove @username` | Stop monitoring, deletes all snapshots |
 | `/list` | Paginated list of monitored accounts |
 | `/recheck @username` | Force an immediate check |

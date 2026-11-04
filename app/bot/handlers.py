@@ -65,6 +65,7 @@ HELP_TEXT = (
     "<b>Commands</b>\n"
     "<code>/add @user</code>, <code>/add https://instagram.com/user</code>, or <code>/add 1234567890</code> — start monitoring\n"
     "<code>/add user1 user2 user3</code> — add several at once (space/comma/newline separated)\n"
+    "<code>/addmedia @user</code> — add with alerts for stories, posts &amp; avatar only (or switch one already monitored)\n"
     "<code>/remove @user</code> — stop monitoring\n"
     "<code>/pause @user</code> · <code>/resume @user</code> — pause/resume a target\n"
     "<code>/list</code> — all accounts\n"
@@ -95,6 +96,7 @@ HELP_TEXT = (
 BOT_COMMANDS: list[BotCommand] = [
     BotCommand("menu", "Open the main menu"),
     BotCommand("add", "Start monitoring an account"),
+    BotCommand("addmedia", "Monitor an account for stories, posts & avatar only"),
     BotCommand("remove", "Stop monitoring an account"),
     BotCommand("pause", "Pause monitoring an account"),
     BotCommand("resume", "Resume monitoring an account"),
@@ -1177,7 +1179,13 @@ async def _do_add(
     context: ContextTypes.DEFAULT_TYPE,
     username: str,
     instagram_id: Optional[str] = None,
+    *,
+    media_only: bool = False,
 ) -> None:
+    """Add one account and run its first check. `media_only` (/addmedia)
+    switches it to alerting only on its stories, posts and avatar, in the
+    same transaction that adds it — so the first check already runs that
+    way — or switches an account that was already monitored."""
     user_id = update.effective_user.id if update.effective_user else None
     chat_id = _chat_id(update)
 
@@ -1188,18 +1196,25 @@ async def _do_add(
             added_by=user_id,
             instagram_id=instagram_id,
         )
+        if media_only:
+            await crud.set_media_only(session, account.id, True)
 
     if not created:
+        note = (
+            " — now alerting only on its stories, posts and avatar."
+            if media_only else "."
+        )
         await _reply_or_edit(
             update,
-            f"<b>@{esc(account.username)}</b> is already being monitored.",
+            f"<b>@{esc(account.username)}</b> is already being monitored{note}",
             reply_markup=keyboards.open_account(account.username),
         )
         return
 
+    mode = " — stories, posts and avatar only" if media_only else ""
     status_msg = await _reply_or_edit(
         update,
-        f"Now monitoring <b>@{esc(account.username)}</b>.\nRunning first check…",
+        f"Now monitoring <b>@{esc(account.username)}</b>{mode}.\nRunning first check…",
         reply_markup=keyboards.open_account(account.username),
     )
 
@@ -1253,6 +1268,8 @@ async def _do_add_bulk(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     tokens: list[str],
+    *,
+    media_only: bool = False,
 ) -> None:
     """Add several accounts from one message, then check them in the background.
 
@@ -1260,6 +1277,8 @@ async def _do_add_bulk(
     id). Adds are persisted immediately and a summary is sent; first checks run
     afterwards in the background so the reply isn't held up by 11 network round
     trips. New accounts baseline silently on that first check (no story flood).
+    `media_only` (/addmedia) puts every one of them, new or already monitored,
+    on stories, posts and avatar alerts only.
     """
     user_id = update.effective_user.id if update.effective_user else None
     chat_id = _chat_id(update)
@@ -1290,9 +1309,13 @@ async def _do_add_bulk(
             account, was_created = await crud.add_account(
                 session, username, added_by=user_id, instagram_id=instagram_id
             )
+            if media_only:
+                await crud.set_media_only(session, account.id, True)
             (created if was_created else already).append(account.username)
 
     lines = [f"📥 <b>Bulk add</b> — {len(tokens)} entr{'y' if len(tokens) == 1 else 'ies'}"]
+    if media_only:
+        lines.append("🎞 Alerts: stories, posts and avatar only")
     if created:
         lines.append(
             f"\n✅ <b>Added ({len(created)})</b>: "
@@ -2252,38 +2275,68 @@ async def _resolve_username_for_instagram_id(
     return await service.instagram.fetch_username_by_id(instagram_id)
 
 
-async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await _reject_if_unauthorized(update):
+async def _add_from_args(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, media_only: bool
+) -> None:
+    """/add's and /addmedia's arguments: one target or several (username,
+    profile URL or numeric id), added and first-checked."""
+    tokens = _split_add_targets(" ".join(context.args))
+    if len(tokens) > 1:
+        await _do_add_bulk(update, context, tokens, media_only=media_only)
         return
-    if context.args:
-        tokens = _split_add_targets(" ".join(context.args))
-        if len(tokens) > 1:
-            await _do_add_bulk(update, context, tokens)
-            return
-        username, instagram_id = _parse_add_target(tokens[0] if tokens else context.args[0])
-        if not username and not instagram_id:
+    username, instagram_id = _parse_add_target(tokens[0] if tokens else context.args[0])
+    if not username and not instagram_id:
+        await update.message.reply_text(
+            "That doesn't look like a valid Instagram username or numeric user ID. "
+            "Letters, numbers, dots, and underscores only (max 30 chars).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.back_to_menu(),
+        )
+        return
+    if instagram_id:
+        username = await _resolve_username_for_instagram_id(
+            context, instagram_id
+        )
+        if not username:
             await update.message.reply_text(
-                "That doesn't look like a valid Instagram username or numeric user ID. "
-                "Letters, numbers, dots, and underscores only (max 30 chars).",
+                "Could not resolve that Instagram ID to a username. "
+                "Try a current numeric user ID or use @username instead.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=keyboards.back_to_menu(),
             )
             return
-        if instagram_id:
-            username = await _resolve_username_for_instagram_id(
-                context, instagram_id
-            )
-            if not username:
-                await update.message.reply_text(
-                    "Could not resolve that Instagram ID to a username. "
-                    "Try a current numeric user ID or use @username instead.",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=keyboards.back_to_menu(),
-                )
-                return
-            await _do_add(update, context, username, instagram_id=instagram_id)
-            return
-        await _do_add(update, context, username)
+        await _do_add(
+            update, context, username, instagram_id=instagram_id,
+            media_only=media_only,
+        )
+        return
+    await _do_add(update, context, username, media_only=media_only)
+
+
+async def cmd_addmedia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/add, with the account alerting only on its stories, posts and avatar
+    from the start — the card's 🎞 Media only switch, without the detour."""
+    if await _reject_if_unauthorized(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: <code>/addmedia &lt;username&gt;</code> — or a profile URL, a "
+            "numeric user ID, or several of them.\n"
+            "Adds the account with alerts for its <b>stories, posts and avatar "
+            "only</b>; follower, bio and name changes stay quiet. An account "
+            "already monitored is switched to that mode.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.back_to_menu(),
+        )
+        return
+    await _add_from_args(update, context, media_only=True)
+
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    if context.args:
+        await _add_from_args(update, context, media_only=False)
         return
     # No argument: enter the username-prompt state.
     # Clear any lingering prompt from a previous interaction first.
@@ -3717,6 +3770,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("addmedia", cmd_addmedia))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("rm", cmd_remove))
     app.add_handler(CommandHandler("pause", cmd_pause))

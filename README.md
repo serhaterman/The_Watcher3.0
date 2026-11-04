@@ -366,6 +366,7 @@ The story/live status is reported from live reel data only — never re-read fro
 |---|---|
 | `/start` or `/menu` | Open the main inline menu |
 | `/add <target>` | Start monitoring — accepts `@username`, `https://instagram.com/username`, or a numeric Instagram ID. Runs an immediate baseline fetch |
+| `/addmedia <target>` | Like `/add`, but the account alerts only on its stories, posts and avatar (follower, bio and name changes stay quiet). Switches an account already monitored to that mode |
 | `/remove <user>` | Stop monitoring and delete all stored history (`/rm` is an alias) |
 | `/pause <user>` | Pause monitoring — the target and its full history stay in the database |
 | `/resume <user>` | Resume a paused target exactly where it left off |
