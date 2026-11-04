@@ -3688,6 +3688,16 @@ async def _handle_account(
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Telegram handler error: {}", context.error)
+    # Say so to whoever tapped. A handler that raised left the button's
+    # spinner turning until Telegram gave up on it, with no word of why.
+    # Best-effort: the query may already be answered, or too old to answer.
+    if isinstance(update, Update) and update.callback_query is not None:
+        try:
+            await update.callback_query.answer(
+                "Something went wrong — please try again.", show_alert=True
+            )
+        except TelegramError:
+            pass
 
 
 async def _unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
