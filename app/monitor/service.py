@@ -530,6 +530,9 @@ class MonitorService:
         # the story phase barely touches Instagram. Same size, so neither
         # side fans out wider than before.
         self._story_semaphore = asyncio.Semaphore(settings.max_concurrent_fetches)
+        # (account_id, phase) -> the lock that keeps two checks, or two story
+        # phases, of one account from running at once. See _account_lock.
+        self._account_locks: dict[tuple[int, str], asyncio.Lock] = {}
         # When a sweep last found the username API refusing every lookup
         # (None = it was answering). Loaded from app_settings on first use so
         # the memory survives a restart; see username_api_known_closed().
@@ -1978,7 +1981,7 @@ class MonitorService:
         rhythm instead of arriving on top of it. Every check stamps the clock
         on the way out, sweep checks included, or the sweep's own traffic
         would be invisible to the gate."""
-        async with self._semaphore:
+        async with self._account_lock(account_id, "check"), self._semaphore:
             if not paced:
                 await self._await_off_schedule_slot()
             try:
@@ -1995,6 +1998,23 @@ class MonitorService:
                 return {"ok": False, "username": username, "error": repr(exc)}
             finally:
                 self._last_check_at = time.monotonic()
+
+    def _account_lock(self, account_id: int, phase: str) -> asyncio.Lock:
+        """The lock for one account's check ("check") or story phase
+        ("story").
+
+        Checks share a three-slot semaphore, and nothing kept two of them off
+        the same account: a sweep check, a stakeout tick and a card Recheck
+        landing together each read the same previous snapshot and announced
+        the same change, and two story phases each loaded the seen-set before
+        either marked anything, so one story went out twice. The second now
+        waits and then reads what the first wrote. One lock per phase, since
+        check_username runs the two one after the other, never nested."""
+        key = (account_id, phase)
+        lock = self._account_locks.get(key)
+        if lock is None:
+            lock = self._account_locks[key] = asyncio.Lock()
+        return lock
 
     async def _await_off_schedule_slot(self) -> None:
         """Hold an off-schedule check back until the gap has passed.
@@ -3279,7 +3299,7 @@ class MonitorService:
         not list. The caller caps how many accounts get this per sweep.
         """
         assert self.stories is not None
-        async with self._story_semaphore:
+        async with self._account_lock(account_id, "story"), self._story_semaphore:
             try:
                 async with get_session() as session:
                     previous_catalog = await crud.get_highlight_catalog(
