@@ -47,6 +47,7 @@ from app.monitor.media_hasher import (
     image_size,
     pic_asset_id,
 )
+from app.monitor.public_page import strip_bidi
 from app.monitor.stories import StoriesClient
 from app.utils.formatting import esc, fmt_timestamp
 from app.utils.logger import logger
@@ -1278,13 +1279,16 @@ class MonitorService:
 
         # Which of them may spend a live reel call on their highlight catalog.
         #
-        # The catalog has exactly one source — the reel query — and while the
-        # profile API is shut, nothing free carries it: the page has never
-        # known it, the Worker's reel route is refused per colo, and the phone
-        # is 429'd on it. So the story phase, which correctly refuses to
-        # re-ask the reel route for a STATUS the page already answered, was
-        # also declining to ask for a catalog nothing else can answer — and
-        # the stored one quietly aged.
+        # A check that read the page usually needs none: the page lists a
+        # public account's whole catalog (see public_page._highlight_catalog,
+        # read since 2026-11-04), so such an account is skipped here. When it
+        # does not — a list Instagram marks as having a next page, or no page
+        # reading at all — the reel query is the only source left, and while
+        # the profile API is shut it is refused per colo (by 2026-11-04 it
+        # answered "require_login" even from a home IP). The story phase
+        # correctly refuses to re-ask the reel route for a STATUS the page
+        # already answered; without this it would also decline to ask for a
+        # catalog nothing else answered, and the stored one would quietly age.
         #
         # A catalog is not a status, though. It changes when its owner adds a
         # highlight, it is re-listed at most once per HIGHLIGHT_SCAN_INTERVAL
@@ -1294,9 +1298,11 @@ class MonitorService:
         # source) cannot turn into seventeen of them; the sweep order is
         # shuffled, so over a few sweeps every due account gets its turn.
         catalog_refresh: set[int] = set()
-        for aid, _, ig_id, _ in story_targets:
+        for aid, _, ig_id, reel in story_targets:
             if len(catalog_refresh) >= _CATALOG_REFRESH_PER_SWEEP:
                 break
+            if reel is not None and reel.get("highlights") is not None:
+                continue
             if ig_id and self._highlight_scan_overdue(aid, highlight_stamps):
                 catalog_refresh.add(aid)
         if catalog_refresh:
@@ -2562,15 +2568,16 @@ class MonitorService:
             }
         elif fetch.partial and "has_public_story" in parsed:
             # The id route did not answer, but the page did — and the page
-            # says whether a story is up (latest_reel_media). It knows neither
-            # a live broadcast nor the highlight catalog, so those stay
-            # unknown; the story phase is told where this came from so it
-            # neither knocks on the refused reel route again nor touches the
-            # stored catalog.
+            # says whether a story is up (latest_reel_media). It does not know
+            # a live broadcast. It knows the highlight catalog when Instagram
+            # lists all of it there (see public_page._highlight_catalog), and
+            # otherwise that stays unknown (None). The story phase is told
+            # where this came from so it does not knock on the refused reel
+            # route for what the page already answered.
             reel_data_response = {
                 "has_public_story": bool(parsed["has_public_story"]),
                 "is_live": False,
-                "highlights": None,
+                "highlights": parsed.get("highlights"),
                 "from_page": True,
             }
             logger.debug(
@@ -2824,6 +2831,7 @@ class MonitorService:
                 # Could this reading read a count at all? A full API answer
                 # always can; a page reading never can.
                 counts_seen=not fetch.partial or "posts_count" in parsed,
+                grid_empty=fetch.partial and parsed.get("grid_empty") is True,
             )
 
         return {
@@ -3024,15 +3032,31 @@ class MonitorService:
         }
 
     async def _fetch_highlight_catalog(
-        self, username: str, instagram_id: Optional[str]
+        self, username: str, instagram_id: Optional[str], *, page: bool = True
     ) -> dict[str, str]:
-        """Highlight reel id -> title via Instagram's graphql reel query (anonymous).
+        """Highlight reel id -> title, from the profile page or the reel query.
+
+        The page goes first when `page` is set: it lists a public account's
+        whole catalog in about a second (see public_page._highlight_catalog),
+        while the reel query is refused through the Worker and, by 2026-11-04,
+        login-walled even from a home IP — ~9 s per refusal, after which the
+        caller fell back to the stored catalog anyway. The reel query is asked
+        only when the page did not list all of it. A caller that already read
+        the page this check passes `page=False`.
 
         The reel query needs the numeric user id, so resolve it from the username
         when it isn't stored yet — otherwise we'd skip the working path entirely.
         The old storiesig fallback is gone (that API was discontinued).
         """
-        if not instagram_id:
+        if page:
+            outcome = await self.instagram.probe_public_page(username)
+            parsed = outcome.get("parsed") or {}
+            if parsed.get("highlights") is not None:
+                return dict(parsed["highlights"])
+            instagram_id = instagram_id or parsed.get("instagram_id")
+        elif not instagram_id:
+            # Not when the page was just asked: a profile fetch would only ask
+            # it again.
             fetch = await self.instagram.fetch_profile(username)
             if fetch.success and fetch.parsed:
                 instagram_id = fetch.parsed.get("instagram_id")
@@ -3117,10 +3141,14 @@ class MonitorService:
         curr_ids = set(current)
         added = [(hid, current[hid]) for hid in sorted(curr_ids - prev_ids)]
         removed = [(hid, previous[hid]) for hid in sorted(prev_ids - curr_ids)]
+        # Titles are compared without invisible bidi marks: the page strips
+        # them and the reel query may not, and an RTL title such as
+        # @opscn1's "حسوني moshi" must not read as renamed to itself when
+        # the catalog's source changes.
         renamed = [
             (hid, previous[hid], current[hid])
             for hid in sorted(prev_ids & curr_ids)
-            if previous[hid] != current[hid]
+            if strip_bidi(previous[hid] or "") != strip_bidi(current[hid] or "")
         ]
         return added, removed, renamed
 
@@ -3237,15 +3265,16 @@ class MonitorService:
 
         A page-derived `reel_data` is topped up from the phone's own reel
         answer when one has landed for this account — free, already fetched,
-        and the only source for the live flag and the highlight catalog while
-        the username API is shut. Nothing is asked for here to get it.
+        and the only source for the live flag (and for the highlight catalog
+        when the page did not list all of it) while the username API is shut.
+        Nothing is asked for here to get it.
 
         `catalog_due` allows ONE live reel call for the highlight catalog
         when nothing free carried it and this account's catalog is past its
         re-scan interval. It is the only thing that overrides the
         don't-re-ask rule, because it is the only thing that rule gets wrong:
-        the story status the page already answered, the catalog it never
-        can. The caller caps how many accounts get this per sweep.
+        the story status the page already answered, a catalog the page did
+        not list. The caller caps how many accounts get this per sweep.
         """
         assert self.stories is not None
         async with self._story_semaphore:
@@ -3263,15 +3292,16 @@ class MonitorService:
                 # result down, so this costs nothing on a healthy check. Only a
                 # failed/absent profile check reaches Instagram again here.
                 # A page-derived status arrives with the reel route already
-                # refused this check: don't knock again, and leave the stored
-                # highlight catalog as it is.
+                # refused this check: don't knock again. Its highlight catalog
+                # is the page's own list when Instagram listed all of it there;
+                # otherwise the stored catalog stands as it is.
                 if reel_data is not None and reel_data.get("from_page") and instagram_id:
                     # The page answered the story question, and the phone's
                     # reel answer for this account has since landed — it was
                     # asked for at the top of the sweep and arrives after the
                     # pages. Reading it costs nothing: no request, no wait.
-                    # It carries the two things the page never knows, the live
-                    # flag and the highlight catalog. The page keeps the story
+                    # It carries the live flag, which the page never knows, and
+                    # the reel query's own catalog. The page keeps the story
                     # flag: that is this check's own live reading, and the one
                     # already weighed against the stored baseline.
                     in_hand = self.instagram.reel_in_hand(str(instagram_id))
@@ -3279,7 +3309,11 @@ class MonitorService:
                         reel_data = {
                             **reel_data,
                             "is_live": bool(in_hand.get("is_live")),
-                            "highlights": in_hand.get("highlights") or {},
+                            "highlights": (
+                                in_hand.get("highlights")
+                                or reel_data.get("highlights")
+                                or {}
+                            ),
                         }
                         logger.debug(
                             "@{}: filled the live flag and the highlight "
@@ -3316,20 +3350,21 @@ class MonitorService:
                     # only that rule. The rule is right about the STATUS: the
                     # page already said whether a story is up, so knocking on
                     # the refused reel route for it buys an answer already in
-                    # hand. It is wrong about the CATALOG, which the page has
-                    # never carried and nothing else can supply — there the
-                    # answer is not known, it is simply missing, and refusing
-                    # to ask is how a stored catalog ages without anyone
-                    # noticing. The caller has already capped how many
-                    # accounts may reach this per sweep.
+                    # hand. It is wrong about a CATALOG the page did not list
+                    # in full — there the answer is not known, it is simply
+                    # missing, and refusing to ask is how a stored catalog
+                    # ages without anyone noticing. The caller has already
+                    # capped how many accounts may reach this per sweep.
                     if attempted_reel:
                         logger.info(
                             "@{}: re-reading the highlight catalog — the page "
-                            "answered the story question but has never known "
-                            "the reels, and this catalog is due", username,
+                            "answered the story question but did not list the "
+                            "whole catalog, and this catalog is due", username,
                         )
+                    # The check already read the page (or failed to), so only
+                    # the reel query is left to ask.
                     catalog = await self._fetch_highlight_catalog(
-                        username, instagram_id
+                        username, instagram_id, page=False
                     )
                     if catalog:
                         logger.info(
@@ -3833,6 +3868,7 @@ class MonitorService:
         *,
         first_seen: bool,
         counts_seen: bool = True,
+        grid_empty: bool = False,
     ) -> None:
         """Download and send new feed posts/reels.
 
@@ -3848,6 +3884,12 @@ class MonitorService:
         no count is readable the LISTING is the detector instead, run at most
         once per POST_SCAN_INTERVAL per account and deduplicated against
         seen_stories exactly as the count-triggered path is.
+
+        `grid_empty` is the page's own listing of the grid: none, and no next
+        page (see public_page._grid_empty). That IS a listing, so it is
+        stamped as one, and saveinsta is not asked: it answers an empty grid
+        with "Video is private.", which made both 0-post public targets read
+        as a failed listing that "asks again" every sweep.
         """
         if self.stories is None:
             return
@@ -3869,6 +3911,17 @@ class MonitorService:
                 "@{}: listing the grid — no post count is readable from this "
                 "source, so a rise cannot be what triggers it", username,
             )
+
+        if grid_empty:
+            async with get_session() as session:
+                await crud.set_setting(
+                    session, self._post_scan_key(account_id), str(time.time())
+                )
+            logger.info(
+                "@{}: grid listed by the page — no posts, so nothing to "
+                "compare", username,
+            )
+            return
 
         try:
             posts = await self.stories.fetch_posts(username)
@@ -4337,7 +4390,8 @@ class MonitorService:
     async def list_highlights(self, username: str) -> dict:
         """Return the current highlight reels (id + title) for any public account.
 
-        Pulls the live catalog from Instagram's anonymous graphql reel query. For
+        Pulls the live catalog from the profile page, or from Instagram's
+        anonymous graphql reel query when the page does not list all of it. For
         monitored accounts it also refreshes the stored catalog and falls back to
         the last stored catalog if the live fetch yields nothing.
         Returns {"ok": bool, "items": list[(id, title)], "error": Optional[str]}.
@@ -4348,8 +4402,8 @@ class MonitorService:
         account_id = account.id if account else None
         instagram_id = account.instagram_id if account else None
 
-        # The highlight catalog (names + ids) comes from Instagram's own graphql
-        # reel query, which works anonymously (the id is resolved from the
+        # The highlight catalog (names + ids) comes from the page, else from
+        # Instagram's own graphql reel query (the id is resolved from the
         # username inside _fetch_highlight_catalog when not already known).
         catalog: dict[str, str] = {}
         try:
@@ -4627,6 +4681,7 @@ class MonitorService:
         is_private: Optional[bool] = None
         posts_count: Optional[int] = None
         highlight_count: Optional[int] = None
+        page_catalog: Optional[dict[str, str]] = None
         fetch = await self.instagram.fetch_profile(username)
         if fetch.success and fetch.parsed:
             parsed = fetch.parsed
@@ -4634,6 +4689,9 @@ class MonitorService:
             posts_count = parsed.get("posts_count")
             highlight_count = parsed.get("story_count")  # = highlight_reel_count
             instagram_id = instagram_id or parsed.get("instagram_id")
+            # A page reading lists the whole catalog itself (see
+            # public_page._highlight_catalog) — no second request for it.
+            page_catalog = parsed.get("highlights")
         elif fetch.http_status == 404:
             return {
                 "ok": False, "items": [], "monitored": account_id is not None,
@@ -4646,7 +4704,14 @@ class MonitorService:
 
         catalog: dict[str, str] = {}
         try:
-            catalog = await self._fetch_highlight_catalog(username, instagram_id)
+            if page_catalog is not None:
+                catalog = dict(page_catalog)
+            else:
+                # Not the page again: the profile fetch above went there
+                # whenever the API refused, and it listed no whole catalog.
+                catalog = await self._fetch_highlight_catalog(
+                    username, instagram_id, page=False
+                )
         except Exception as exc:  # pragma: no cover - network failure path
             logger.warning(
                 "Bulk-download highlight catalog failed for @{}: {}", username, exc

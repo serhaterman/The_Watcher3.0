@@ -19,6 +19,11 @@ profile_pic_url_hd (~320px), and it cannot be upsized: the CDN signature covers
 the size transform, so editing `stp=` earns a 403 "URL signature mismatch"
 (measured 2026-08-12).
 
+What it does carry beyond the profile, for a public account: the whole
+highlight catalog when Instagram lists all of it, and the first page of the
+post grid (see `_highlight_catalog` and `_grid_empty`, read since 2026-11-04,
+when the reel query that used to supply the catalog went login-only).
+
 ## Why not the og: tags (this parser's first version, withdrawn 2026-08-12)
 
 Because they are a stale cache, and a page can carry both at once. Verified on
@@ -130,8 +135,8 @@ def _extract_object(page: str, start: int) -> Optional[str]:
     return None
 
 
-def _profile_object(window: str, username: str) -> Optional[dict[str, Any]]:
-    """The profile block among the page's `xig_user_by_username` blocks.
+def _blocks(window: str, username: str) -> list[dict[str, Any]]:
+    """Every `xig_user_by_username` block on the page, in page order.
 
     The page preloads two Relay queries under that same key: the profile
     (PolarisLoggedOutDesktopWWWProfileRootContentQuery — counts, bio, flags)
@@ -142,11 +147,12 @@ def _profile_object(window: str, username: str) -> Optional[dict[str, Any]]:
     minute apart. Taking the first occurrence failed every grid-first page
     as "no profile payload", the same accounts sweep after sweep.
     """
+    blocks: list[dict[str, Any]] = []
     start = 0
     for _ in range(_MAX_OCCURRENCES):
         key_at = window.find(_KEY, start)
         if key_at < 0:
-            return None
+            break
         start = key_at + len(_KEY)
         raw = _extract_object(window, start)
         if raw is None:
@@ -156,8 +162,68 @@ def _profile_object(window: str, username: str) -> Optional[dict[str, Any]]:
         except ValueError:
             logger.debug("A payload block for @{} was not valid JSON", username)
             continue
-        if isinstance(block, dict) and any(k in block for k in _PROFILE_MARKERS):
-            return block
+        if isinstance(block, dict):
+            blocks.append(block)
+    return blocks
+
+
+def _highlight_catalog(user: dict[str, Any]) -> Optional[dict[str, str]]:
+    """The highlight catalog (reel id -> title) when the page lists ALL of it.
+
+    `lox_highlights_connection` carries the same highlight-reel ids as the
+    reel query: the canonical ones, which resolve at
+    instagram.com/stories/highlights/<id>/ to this account. Verified
+    2026-11-04: @whos.lisianna's page listed the 3 reels the reel query had
+    stored the day before, and its first id opened as "☆ = @whos.lisianna".
+    It is the catalog source that still answers: by then the reel query said
+    "require_login" even from a home IP.
+
+    The connection is paginated, so it is a catalog only when Instagram says
+    there is no next page. A partial list would read as highlights being
+    removed. None means unknown, never empty.
+    """
+    connection = user.get("lox_highlights_connection")
+    if not isinstance(connection, dict):
+        return None
+    edges = connection.get("edges")
+    page_info = connection.get("page_info")
+    if not isinstance(edges, list) or not isinstance(page_info, dict):
+        return None
+    if page_info.get("has_next_page") is not False:
+        return None
+    catalog: dict[str, str] = {}
+    for edge in edges:
+        node = edge.get("node") if isinstance(edge, dict) else None
+        highlight_id = node.get("id") if isinstance(node, dict) else None
+        if not isinstance(highlight_id, (str, int)) or not str(highlight_id).isdigit():
+            return None  # a list with an unreadable entry is not a complete one
+        catalog[str(highlight_id)] = _text(node.get("title")) or ""
+    return catalog
+
+
+def _grid_empty(blocks: list[dict[str, Any]], pk: Optional[str]) -> Optional[bool]:
+    """Whether this account's post grid, as the page lists it, is empty.
+
+    The grid block carries the newest posts and Instagram's own
+    `has_next_page`: @natgeo's page listed 12 with a next page, while
+    @whos.lisianna's and @opscn1's listed none and no next page (both have 0
+    posts). True only for that explicit "none, and nothing after"; False when
+    any post is listed; None when the block is missing or is not this
+    account's.
+    """
+    if not pk:
+        return None
+    for block in blocks:
+        connection = block.get("polaris_ordered_timeline_connection")
+        if not isinstance(connection, dict) or str(block.get("pk")) != pk:
+            continue
+        edges = connection.get("edges")
+        page_info = connection.get("page_info")
+        if not isinstance(edges, list) or not isinstance(page_info, dict):
+            return None
+        if edges:
+            return False
+        return True if page_info.get("has_next_page") is False else None
     return None
 
 
@@ -190,7 +256,10 @@ def parse_public_profile(page: str, username: str) -> Optional[dict[str, Any]]:
     if not page:
         return None
 
-    user = _profile_object(page[:_SCAN_LIMIT], username)
+    blocks = _blocks(page[:_SCAN_LIMIT], username)
+    user = next(
+        (b for b in blocks if any(k in b for k in _PROFILE_MARKERS)), None
+    )
     if user is None:
         return None
 
@@ -246,6 +315,16 @@ def parse_public_profile(page: str, username: str) -> Optional[dict[str, Any]]:
             url = _text(first.get("url"))
             if url:
                 parsed["external_url"] = url
+
+    # Highlights and the post grid, for PUBLIC accounts only: a logged-out
+    # viewer sees a private account's lists as empty whatever they hold.
+    if parsed.get("is_private") is False:
+        catalog = _highlight_catalog(user)
+        if catalog is not None:
+            parsed["highlights"] = catalog
+        grid_empty = _grid_empty(blocks, parsed.get("instagram_id"))
+        if grid_empty is not None:
+            parsed["grid_empty"] = grid_empty
 
     # A payload with no counts and no privacy flag isn't a profile — refuse it
     # rather than hand back a near-empty dict that looks like a reading.

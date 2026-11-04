@@ -1098,10 +1098,13 @@ class InstagramClient:
         door = outcome.get("door") or "direct"
         if door == "direct" and outcome.get("route") not in (None, "this host"):
             door = f"direct, via {outcome['route']}"
+        # Counted against PARTIAL_FIELDS only: the reading also carries
+        # extras (story status, highlights, grid) that are not profile fields.
         logger.info(
             "@{} answered on the public page ({}) after the API blocked us — "
             "partial data ({} of {} fields)",
-            username, door, len(parsed), len(PARTIAL_FIELDS),
+            username, door, sum(1 for f in PARTIAL_FIELDS if f in parsed),
+            len(PARTIAL_FIELDS),
         )
         return ProfileFetchResult(
             username=username,
