@@ -554,6 +554,18 @@ def render_rename_message(old: str, new: str, *, collided: bool = False) -> str:
     return "\n".join(lines)
 
 
+def render_found_again_message(username: str) -> str:
+    """Sent once when an account the chat was told "doesn't exist" answers
+    again, so that alert does not stand uncorrected. On 2026-11-04 six live
+    accounts were reported missing because Instagram's username lookup had
+    started answering 404 for every username."""
+    return (
+        f"✅ <b>@{esc(username)}</b> answers again — the account exists.\n"
+        "<i>This check read the profile live, so the earlier “doesn't "
+        "exist” alert no longer holds.</i>"
+    )
+
+
 def render_not_found_message(
     username: str, failure_count: int, id_probe: Optional[IdProbe]
 ) -> str:

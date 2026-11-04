@@ -15,6 +15,7 @@ from app.bot.notifications import (
     render_changes_message,
     render_digest,
     render_failure_message,
+    render_found_again_message,
     render_highlight_catalog_changes,
     render_new_stories_alert,
     render_not_found_message,
@@ -2812,6 +2813,7 @@ class MonitorService:
             new_pic_path=hashed.local_path if hashed else None,
             notify_unchanged=notify_unchanged,
         )
+        await self._clear_not_found(account_id, username)
 
         # New post/reel auto-download for public accounts (login-free via
         # saveinsta). On the first observation we just baseline what's already
@@ -2851,6 +2853,39 @@ class MonitorService:
             # story phase reports status from THIS, never from the snapshot.
             "reel_data": reel_data_response,
         }
+
+    async def _clear_not_found(self, account_id: int, username: str) -> None:
+        """Correct a standing "doesn't exist" alert once the account answers.
+
+        Nothing used to: a target reported missing went back to normal
+        readings in silence, so the chat was left believing it was gone.
+        That is how the six false alerts of 2026-11-04 (the username API
+        answering 404 for everyone) would have stood for good. One message
+        per alert, in the account's topic: it is sent only while the
+        account's newest such notification is the "not found" one.
+        """
+        async with get_session() as session:
+            latest = await crud.latest_notification_type(
+                session, account_id, ("not_found", "found_again")
+            )
+        if latest != "not_found":
+            return
+        logger.info(
+            "@{} answers again after a \"doesn't exist\" alert — telling the "
+            "chat that alert no longer holds", username,
+        )
+        msg = render_found_again_message(username)
+        thread_id = await self.topic_for(account_id, username)
+        delivered = await self.notifier.send_text(msg, message_thread_id=thread_id)
+        async with get_session() as session:
+            await crud.log_notification(
+                session,
+                account_id=account_id,
+                change_type="found_again",
+                payload={"old": "not found", "new": "answering"},
+                message=msg,
+                delivered=delivered,
+            )
 
     @staticmethod
     def _went_public(changeset: ChangeSet) -> bool:
