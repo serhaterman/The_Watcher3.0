@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import html
+import re
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -96,10 +98,10 @@ class NotificationDispatcher:
         for chunk in chunks:
             for cid, thread in self._targets(message_thread_id):
                 ok = await self._send_with_retry(
-                    lambda chat, th, c=chunk: self.bot.send_message(
+                    lambda chat, th, markup, c=chunk: self.bot.send_message(
                         chat_id=chat,
-                        text=c,
-                        parse_mode=parse_mode,
+                        text=c if markup or parse_mode is None else _plain_text(c),
+                        parse_mode=parse_mode if markup else None,
                         disable_web_page_preview=True,
                         message_thread_id=th,
                     ),
@@ -150,21 +152,19 @@ class NotificationDispatcher:
 
         as_file = settings.photos_as_files
 
-        def _send(chat, thread):
+        def _send(chat, thread, markup):
             if as_file:
                 return self.bot.send_document(
                     chat_id=chat,
                     document=media,
-                    caption=caption or "",
-                    parse_mode=ParseMode.HTML,
+                    **_caption(caption, markup),
                     message_thread_id=thread,
                     **_UPLOAD_TIMEOUTS,
                 )
             return self.bot.send_photo(
                 chat_id=chat,
                 photo=media,
-                caption=caption or "",
-                parse_mode=ParseMode.HTML,
+                **_caption(caption, markup),
                 message_thread_id=thread,
                 **_UPLOAD_TIMEOUTS,
             )
@@ -185,12 +185,11 @@ class NotificationDispatcher:
         if media is None:
             return False
 
-        def _send(chat, thread):
+        def _send(chat, thread, markup):
             return self.bot.send_document(
                 chat_id=chat,
                 document=media,
-                caption=caption or "",
-                parse_mode=ParseMode.HTML,
+                **_caption(caption, markup),
                 message_thread_id=thread,
                 **_UPLOAD_TIMEOUTS,
             )
@@ -208,12 +207,11 @@ class NotificationDispatcher:
         if media is None:
             return False
 
-        def _send(chat, thread):
+        def _send(chat, thread, markup):
             return self.bot.send_video(
                 chat_id=chat,
                 video=media,
-                caption=caption or "",
-                parse_mode=ParseMode.HTML,
+                **_caption(caption, markup),
                 supports_streaming=True,
                 message_thread_id=thread,
                 **_UPLOAD_TIMEOUTS,
@@ -246,9 +244,11 @@ class NotificationDispatcher:
         chat_id: Union[int, str],
         message_thread_id: Optional[int] = None,
     ) -> bool:
-        # `action(chat_id, thread)` — thread can be cleared mid-flight if
-        # Telegram reports the topic gone (handled in the BadRequest branch).
+        # `action(chat_id, thread, markup)` — thread can be cleared mid-flight
+        # if Telegram reports the topic gone, and markup dropped if it rejects
+        # the formatting (both handled in the BadRequest branch).
         thread = message_thread_id
+        markup = True
         # Texts and uploads serialize independently — see __init__.
         lock = self._upload_lock if is_upload else self._text_lock
 
@@ -256,7 +256,7 @@ class NotificationDispatcher:
             delay: float = 0.0
             async with lock:
                 try:
-                    result = action(chat_id, thread)
+                    result = action(chat_id, thread, markup)
                     if asyncio.iscoroutine(result):
                         await result
                     return True
@@ -270,8 +270,22 @@ class NotificationDispatcher:
                         )
                         thread = None
                         continue
-                    delay = min(10.0, 2 ** attempt)
-                    logger.warning("Telegram error attempt {}/4: {}", attempt, exc)
+                    # Formatting Telegram cannot parse must not eat the
+                    # message either: the same words go out once more, as
+                    # plain text.
+                    if markup and "can't parse entities" in str(exc).lower():
+                        logger.warning(
+                            "Telegram rejected the formatting ({}); resending "
+                            "as plain text", exc,
+                        )
+                        markup = False
+                        continue
+                    # Any other 400 is Telegram refusing THIS request, and it
+                    # answers the same request the same way every time. The
+                    # old loop resent it four times anyway — 24 s of backoff
+                    # for a message that was never going to arrive.
+                    logger.error("Telegram rejected the message: {}", exc)
+                    return False
                 except RetryAfter as ra:
                     # Cap at 30s so the lock isn't held (or slept) for minutes
                     delay = min(float(ra.retry_after) + 1.0, 30.0)
@@ -605,6 +619,27 @@ def render_not_found_message(
             "confirmed this time — it is re-tried on every check.</i>"
         )
     return "\n".join(lines)
+
+
+# The tags Telegram's HTML mode accepts. Only these are stripped for the
+# plain-text fallback, so a literal "<3" in someone's name survives as text.
+_TELEGRAM_TAG_RE = re.compile(
+    r"</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|a|span|tg-spoiler|"
+    r"tg-emoji|blockquote)(?:\s[^<>]*)?>",
+    re.IGNORECASE,
+)
+
+
+def _plain_text(text: str) -> str:
+    """An HTML-mode message as the plain text Telegram would have shown."""
+    return html.unescape(_TELEGRAM_TAG_RE.sub("", text))
+
+
+def _caption(caption: Optional[str], markup: bool) -> dict:
+    """send_* keyword arguments for a caption, with or without its markup."""
+    if markup:
+        return {"caption": caption or "", "parse_mode": ParseMode.HTML}
+    return {"caption": _plain_text(caption or ""), "parse_mode": None}
 
 
 def _split_text(text: str, *, limit: int) -> list[str]:
