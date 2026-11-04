@@ -269,10 +269,10 @@ class Settings(BaseSettings):
     # count; a request through its public edge does. So the app asks its own
     # public /health this often: every 5 minutes, so even a ping that fails
     # leaves the next one inside the 15. Render sets RENDER_EXTERNAL_URL
-    # itself; with no URL, or 0 here, nothing is pinged. Always-on fits the
-    # free plan's 750 instance hours a month for one service.
+    # itself (the field is declared with the Telegram settings above); with
+    # no URL, or 0 here, nothing is pinged. Always-on fits the free plan's
+    # 750 instance hours a month for one service.
     keep_awake_seconds: int = Field(default=300, alias="KEEP_AWAKE_SECONDS")
-    render_external_url: Optional[str] = Field(default=None, alias="RENDER_EXTERNAL_URL")
     # Render injects the deployed commit's SHA. /ready (public) and /status
     # report it, so a deploy can be confirmed live instead of assumed.
     render_git_commit: Optional[str] = Field(default=None, alias="RENDER_GIT_COMMIT")
