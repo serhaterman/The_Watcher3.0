@@ -527,30 +527,13 @@ async def recent_notifications(
     stmt = (
         select(NotificationLog)
         .where(NotificationLog.account_id == account_id)
-        .order_by(desc(NotificationLog.created_at))
+        # id tiebreaker: SQLite stores created_at in whole seconds, and two
+        # events of one check land in the same one.
+        .order_by(desc(NotificationLog.created_at), desc(NotificationLog.id))
         .limit(limit)
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
-
-
-async def latest_notification_type(
-    session: AsyncSession, account_id: int, change_types: Iterable[str]
-) -> Optional[str]:
-    """The change_type of this account's newest notification among
-    `change_types`, or None when it has none of them."""
-    stmt = (
-        select(NotificationLog.change_type)
-        .where(
-            NotificationLog.account_id == account_id,
-            NotificationLog.change_type.in_(list(change_types)),
-        )
-        # id tiebreaker: SQLite stores created_at in whole seconds.
-        .order_by(desc(NotificationLog.created_at), desc(NotificationLog.id))
-        .limit(1)
-    )
-    result = await session.execute(stmt)
-    return result.scalar_one_or_none()
 
 
 async def notifications_since(

@@ -135,13 +135,40 @@ async def _new_account(username: str, instagram_id: Optional[str]) -> int:
         return account.id
 
 
-async def _alert(account_id: int) -> None:
-    """The "doesn't exist" alert, as _handle_failure logs it."""
+async def _report_missing(service: MonitorService, account_id: int, username: str) -> None:
+    """Two failed checks that say "User not found": the second one is what
+    sends the "doesn't exist" alert, through the real failure path."""
+    gone = ProfileFetchResult(
+        username=username, http_status=404, error="User not found (public page)",
+        source="public_page",
+    )
+    for _ in range(2):
+        await service._handle_failure(
+            account_id, username, gone, id_probe=IdProbe(user_id="1", status=401)
+        )
+
+
+async def _old_alert(account_id: int) -> None:
+    """A "doesn't exist" alert logged before corrections existed — what
+    every account's history held on 2026-11-05, up to 90 days back."""
     async with get_session() as session:
         await crud.log_notification(
             session, account_id=account_id, change_type="not_found",
             payload={"status": 404}, message="❓ doesn't exist", delivered=True,
         )
+
+
+async def _answered(account_id: int) -> None:
+    """What a successful reading records about the account."""
+    async with get_session() as session:
+        await crud.mark_checked(session, account_id, 200, success=True)
+
+
+def _alerts(service) -> list[str]:
+    return [
+        c.args[0] for c in service.notifier.send_text.await_args_list
+        if "doesn't exist" in c.args[0] and "answers again" not in c.args[0]
+    ]
 
 
 async def test_an_alert_is_corrected_once() -> None:
@@ -151,35 +178,53 @@ async def test_an_alert_is_corrected_once() -> None:
     await service._clear_not_found(account_id, "wasmissing")
     expect("nothing to correct before any alert", _corrections(service) == [])
 
-    await _alert(account_id)
+    await _report_missing(service, account_id, "wasmissing")
+    expect("the failure path sent the alert", len(_alerts(service)) == 1,
+           repr(_alerts(service)))
     await service._clear_not_found(account_id, "wasmissing")
     expect("one correction after the alert",
            len(_corrections(service)) == 1, repr(_corrections(service)))
+    await _answered(account_id)
     await service._clear_not_found(account_id, "wasmissing")
     expect("and only one", len(_corrections(service)) == 1, repr(_corrections(service)))
 
-    await _alert(account_id)
+    await _report_missing(service, account_id, "wasmissing")
     await service._clear_not_found(account_id, "wasmissing")
     expect("a new alert earns a new correction",
            len(_corrections(service)) == 2, repr(_corrections(service)))
     async with get_session() as session:
-        latest = await crud.latest_notification_type(
-            session, account_id, ("not_found", "found_again")
-        )
-    expect("the correction is on record", latest == "found_again", repr(latest))
+        notes = await crud.recent_notifications(session, account_id, limit=1)
+    expect("the correction is on record",
+           bool(notes) and notes[0].change_type == "found_again",
+           repr([n.change_type for n in notes]))
+
+
+async def test_an_old_alert_is_not_corrected() -> None:
+    """The flood of 2026-11-05: the first sweep after corrections shipped
+    sent "answers again" to all 17 accounts, because each had some old
+    "doesn't exist" alert in its 90-day history with no correction after it.
+    Only an alert raised since the account last answered may be corrected."""
+    account_id = await _new_account("longago", "4550")
+    await _old_alert(account_id)
+    service = _service()
+    await service._clear_not_found(account_id, "longago")
+    expect("an alert from before the account last answered gets no correction",
+           _corrections(service) == [], repr(_corrections(service)))
 
 
 async def test_the_sweep_corrects_the_accounts_it_reported_missing() -> None:
     """The sweep that reads them again is what speaks — once — and only for
-    the account the chat was actually told about."""
+    the account the chat was told about in the failure that just ended."""
     async with get_session() as session:
         for a in await crud.list_accounts(session, only_active=True):
             await crud.set_account_active(session, a.username, False)
-    missing = await _new_account("toldmissing", "4601")
-    await _new_account("neverreported", "4602")
-    await _alert(missing)
-
     service = _service(stories=QuietStories())
+    missing = await _new_account("toldmissing", "4601")
+    await _report_missing(service, missing, "toldmissing")
+    stale = await _new_account("oldalert", "4602")
+    await _old_alert(stale)
+    await _new_account("neverreported", "4603")
+
     await service.check_all()
     first = _corrections(service)
     expect("one correction in the sweep that reads it again",
@@ -194,6 +239,7 @@ async def main() -> int:
         await conn.run_sync(Base.metadata.create_all)
 
     await test_an_alert_is_corrected_once()
+    await test_an_old_alert_is_not_corrected()
     await test_the_sweep_corrects_the_accounts_it_reported_missing()
 
     await engine.dispose()

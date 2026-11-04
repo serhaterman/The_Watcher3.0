@@ -2391,6 +2391,13 @@ class MonitorService:
                     message=msg,
                     delivered=delivered,
                 )
+                if change_type == "not_found":
+                    # Standing until the account next answers — what
+                    # _clear_not_found corrects, and the only thing it does.
+                    await crud.set_setting(
+                        session, self._not_found_key(account_id),
+                        datetime.now(timezone.utc).isoformat(),
+                    )
 
         return {
             "ok": False,
@@ -2884,6 +2891,12 @@ class MonitorService:
             "reel_data": reel_data_response,
         }
 
+    @staticmethod
+    def _not_found_key(account_id: int) -> str:
+        """Set when a "doesn't exist" alert goes out, cleared when the
+        account next answers. See _clear_not_found."""
+        return f"not_found_alert:{account_id}"
+
     async def _clear_not_found(self, account_id: int, username: str) -> None:
         """Correct a standing "doesn't exist" alert once the account answers.
 
@@ -2891,15 +2904,19 @@ class MonitorService:
         readings in silence, so the chat was left believing it was gone.
         That is how the six false alerts of 2026-11-04 (the username API
         answering 404 for everyone) would have stood for good. One message
-        per alert, in the account's topic: it is sent only while the
-        account's newest such notification is the "not found" one.
+        per alert, in the account's topic.
+
+        Only an alert raised since the account last answered is corrected —
+        the marker _handle_failure sets with it. Judging by the notification
+        history instead (its newest "not found" with no correction after it)
+        corrected all 17 accounts at once on 2026-11-05: each had some old
+        alert in its 90-day history, from before corrections existed.
         """
+        key = self._not_found_key(account_id)
         async with get_session() as session:
-            latest = await crud.latest_notification_type(
-                session, account_id, ("not_found", "found_again")
-            )
-        if latest != "not_found":
-            return
+            if await crud.get_setting(session, key) is None:
+                return
+            await crud.delete_setting(session, key)
         logger.info(
             "@{} answers again after a \"doesn't exist\" alert — telling the "
             "chat that alert no longer holds", username,
