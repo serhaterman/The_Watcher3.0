@@ -958,19 +958,22 @@ with the bot. When unset, any user can interact (suitable for personal use).
 
 ## 8. HTTP API
 
-All endpoints are under the FastAPI app. Optional bearer token auth via
-`WEB_API_TOKEN`.
+All endpoints are under the FastAPI app. The token is `WEB_API_TOKEN`, sent
+as the `X-API-Token` header. The two read endpoints that expose what is being
+monitored always need it and answer 404 while it is unset (until 2026-11-05
+`/accounts` listed every monitored username to anyone with the URL). The two
+mutation endpoints need it whenever it is configured.
 
-| Method | Path | Description |
-|---|---|---|
-| GET | `/` | Health + endpoint list |
-| GET | `/health` | Liveness probe |
-| GET | `/ready` | Readiness probe (checks DB) |
-| GET | `/status` | Scheduler state, account counts |
-| GET | `/accounts` | List all monitored accounts |
-| POST | `/accounts/{username}/recheck` | Trigger an immediate check |
-| POST | `/sweep` | Trigger a full sweep (all accounts) |
-| POST | `/telegram/webhook` | Telegram webhook receiver |
+| Method | Path | Token | Description |
+|---|---|---|---|
+| GET | `/` | — | Health + endpoint list |
+| GET | `/health` | — | Liveness probe (Render's health check, keep-awake ping) |
+| GET | `/ready` | — | Readiness probe: monitor and scheduler state, deployed `commit` |
+| GET | `/status` | always | Scheduler state, account counts, fetch health |
+| GET | `/accounts` | always | List all monitored accounts |
+| POST | `/accounts/{username}/recheck` | if set | Trigger an immediate check |
+| POST | `/sweep` | if set | Trigger a full sweep (all accounts) |
+| POST | `/telegram/webhook` | Telegram's | Telegram webhook receiver |
 
 ---
 
@@ -1058,7 +1061,7 @@ All settings are read from environment variables (or a `.env` file locally).
 | Env Var | Default | Description |
 |---|---|---|
 | `MEDIA_DIR` | `./data/media` | Local directory for downloaded profile pictures |
-| `WEB_API_TOKEN` | — | Bearer token for HTTP API auth |
+| `WEB_API_TOKEN` | — | `X-API-Token` for the HTTP API; `/status` and `/accounts` stay disabled without it |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `PORT` | `8000` | Web server port (injected by Render automatically) |
 | `PROXY_URL` | — | Optional HTTP/HTTPS/SOCKS5 proxy for all outbound requests. Wins over `HTTP_PROXY`/`HTTPS_PROXY`. Note it wraps the whole session, so with `IG_PROXY_URL` set it applies to the hop that reaches the Worker — not to the Worker's own egress to Instagram |

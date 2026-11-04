@@ -354,7 +354,7 @@ The story/live status is reported from live reel data only — never re-read fro
 
 | Variable | Default | Description |
 |---|---|---|
-| `WEB_API_TOKEN` | _(empty)_ | If set, required as `X-API-Token` header for `/sweep` and `/accounts/*/recheck` |
+| `WEB_API_TOKEN` | _(empty)_ | Sent as the `X-API-Token` header. Required for `/status` and `/accounts`, which are disabled while it is unset; if set, also required for `/sweep` and `/accounts/*/recheck` |
 | `PORT` | `8000` | Web server port |
 | `LOG_LEVEL` | `INFO` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
@@ -408,19 +408,20 @@ The story/live status is reported from live reel data only — never re-read fro
 
 ## 🔌 HTTP API
 
-All responses are JSON. Mutation endpoints require `X-API-Token` when `WEB_API_TOKEN` is configured.
+All responses are JSON. Endpoints marked **Token** take the `X-API-Token` header. `/status` and `/accounts` expose what is being monitored, so they always need it and answer 404 while `WEB_API_TOKEN` is unset. The two mutation endpoints need it whenever it is configured.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET`/`HEAD` | `/health` | None | Liveness probe — returns `{"status":"ok"}` |
-| `GET` | `/ready` | None | Readiness probe — checks monitor and scheduler state |
-| `GET` | `/status` | None | Stats: account counts, last sweep time, scheduler info |
-| `GET` | `/accounts` | None | List all monitored accounts |
+| `GET`/`HEAD` | `/health` | None | Liveness probe — returns `{"ok":true}` |
+| `GET` | `/ready` | None | Readiness probe — monitor and scheduler state, plus the deployed `commit` |
+| `GET` | `/status` | Token | Stats: account counts, scheduler info, fetch health |
+| `GET` | `/accounts` | Token | List all monitored accounts |
 | `POST` | `/accounts/{username}/recheck` | Token | Force an immediate check for one account |
 | `POST` | `/sweep` | Token | Trigger a full sweep across all active accounts |
 
 ```bash
 curl -X POST https://<host>/sweep -H "X-API-Token: your-token"
+curl https://<host>/accounts -H "X-API-Token: your-token"
 ```
 
 ---

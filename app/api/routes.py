@@ -36,6 +36,27 @@ def _check_token(token: Optional[str]) -> None:
         )
 
 
+def _check_read_token(token: Optional[str]) -> None:
+    """Require WEB_API_TOKEN on the endpoints that read monitoring data.
+
+    Unlike _check_token this fails CLOSED. /accounts lists every monitored
+    username, and until 2026-11-05 anyone with the service URL could read
+    it: a deployment without a token must not publish that list. Render
+    generates the token (render.yaml), so there it is always set.
+    """
+    expected = settings.web_api_token
+    if not expected:
+        raise HTTPException(
+            status_code=404, detail="disabled (WEB_API_TOKEN not set)"
+        )
+    if not token or not secrets.compare_digest(
+        token.encode("utf-8"), expected.encode("utf-8")
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing token"
+        )
+
+
 def get_service(request: Request) -> MonitorService:
     svc = getattr(request.app.state, "monitor", None)
     if svc is None:
@@ -64,11 +85,16 @@ async def ready(request: Request) -> dict:
         "ok": bool(monitor and scheduler and scheduler.scheduler.running),
         "monitor": bool(monitor),
         "scheduler_running": bool(scheduler and scheduler.scheduler.running),
+        # Public on purpose: the one thing a deploy check needs from outside.
+        "commit": settings.render_git_commit,
     }
 
 
 @router.get("/status")
-async def status_endpoint(request: Request) -> dict:
+async def status_endpoint(
+    request: Request, x_api_token: Optional[str] = Header(default=None)
+) -> dict:
+    _check_read_token(x_api_token)
     async with get_session() as session:
         stats = await crud.stats_summary(session)
 
@@ -87,7 +113,8 @@ async def status_endpoint(request: Request) -> dict:
 
 
 @router.get("/accounts")
-async def list_accounts() -> dict:
+async def list_accounts(x_api_token: Optional[str] = Header(default=None)) -> dict:
+    _check_read_token(x_api_token)
     async with get_session() as session:
         accounts = await crud.list_accounts(session, only_active=False)
 
