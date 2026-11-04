@@ -82,6 +82,7 @@ async def status_endpoint(request: Request) -> dict:
         "check_interval": settings.check_interval,
         "jitter_seconds": settings.jitter_seconds,
         "fetch_health": fetch_health.snapshot(),
+        "commit": settings.render_git_commit,
     }
 
 

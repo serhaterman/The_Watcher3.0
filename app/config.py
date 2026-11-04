@@ -273,6 +273,9 @@ class Settings(BaseSettings):
     # free plan's 750 instance hours a month for one service.
     keep_awake_seconds: int = Field(default=300, alias="KEEP_AWAKE_SECONDS")
     render_external_url: Optional[str] = Field(default=None, alias="RENDER_EXTERNAL_URL")
+    # Render injects the deployed commit's SHA. /status reports it, so a
+    # deploy can be confirmed live instead of assumed.
+    render_git_commit: Optional[str] = Field(default=None, alias="RENDER_GIT_COMMIT")
 
     # Optional proxy (single URL applied to both http and https)
     proxy_url: Optional[str] = Field(default=None, alias="PROXY_URL")
