@@ -587,6 +587,37 @@ async def test_story_phase_applies_the_cadence() -> None:
         settings.highlight_scan_interval = original
 
 
+async def test_a_signed_avatar_url_is_fetched_once() -> None:
+    """The size-stripped variant of a SIGNED avatar URL is a guaranteed 403
+    (its signature covers the size transform, measured 2026-08-12), so asking
+    for it first cost one wasted CDN round trip per avatar download. An
+    unsigned URL still gets the attempt."""
+    from app.monitor.media_hasher import MediaHasher
+
+    signed = ("https://scontent-lga3-1.cdninstagram.com/v/t51.82787-19/"
+              "860047426_n.jpg?stp=dst-jpg_s150x150_tt6&_nc_cat=1&oh=00_Af&oe=6912")
+    unsigned = ("https://scontent.cdninstagram.com/v/t51.2885-19/s320x320/"
+                "123_n.jpg?stp=dst-jpg_s320x320")
+    for url, expected in ((signed, 1), (unsigned, 2)):
+        hasher = MediaHasher()
+        asked: list[str] = []
+
+        async def fetch(candidate, username, asked=asked):
+            asked.append(candidate)
+            return None
+
+        hasher._fetch_and_store = fetch
+        try:
+            await hasher.hash_url(url, "avatar_owner")
+        finally:
+            await hasher.close()
+        kind = "signed" if url is signed else "unsigned"
+        expect(f"a {kind} avatar URL is asked for {expected} time(s)",
+               len(asked) == expected, repr(asked))
+        expect(f"and the {kind} original is always among them",
+               url in asked, repr(asked))
+
+
 async def main() -> int:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -609,6 +640,7 @@ async def main() -> int:
     await test_story_listing_follows_the_live_flag()
     await test_highlight_scan_cadence()
     await test_story_phase_applies_the_cadence()
+    await test_a_signed_avatar_url_is_fetched_once()
 
     await engine.dispose()
     print()

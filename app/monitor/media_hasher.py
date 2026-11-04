@@ -111,11 +111,14 @@ def _strip_cdn_size(url: str) -> Optional[str]:
     image; the anonymous ceiling stays profile_pic_url_hd (~320px), or the
     media downloader's full-resolution avatar.
 
-    The attempt is kept because hash_url falls back correctly (403 -> None ->
-    retry the original), and an unsigned/legacy URL would still benefit — but
-    on today's URLs it costs one guaranteed-403 round trip per download.
+    So a SIGNED url (one carrying `oh=`) is left alone: stripping it cost one
+    guaranteed-403 round trip per download. An unsigned/legacy URL is still
+    stripped, since it would benefit, and hash_url falls back correctly either
+    way (403 -> None -> retry the original).
     """
     if "fbcdn.net" not in url and "cdninstagram.com" not in url:
+        return None
+    if "oh" in parse_qs(urlparse(url).query, keep_blank_values=True):
         return None
 
     modified = False
