@@ -330,7 +330,8 @@ class _SweepThrottle:
     def username_door_closed(self) -> bool:
         """True once `breaker_threshold` username lookups in a row were
         refused with none answering this sweep. From then on the remaining
-        accounts are checked by numeric id only: that door is shut, and every
+        accounts skip the username API and go straight to the page doors (and
+        the numeric id when no page answers): that door is shut, and every
         further knock is blocked traffic for an answer already known."""
         return self._username_door_closed
 
@@ -405,8 +406,9 @@ class _SweepThrottle:
                 self._username_door_closed = True
                 logger.warning(
                     "Instagram refused {} username lookups in a row and "
-                    "answered none — checking the rest of the sweep by "
-                    "numeric id only", self._consecutive_user_blocks,
+                    "answered none — the rest of the sweep skips the username "
+                    "API and reads the page (the numeric id if no page "
+                    "answers)", self._consecutive_user_blocks,
                 )
 
         # Instagram answered if the username side came back 200 — from the
