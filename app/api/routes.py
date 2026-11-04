@@ -25,12 +25,21 @@ from app.workers.scheduler import WatcherScheduler
 router = APIRouter()
 
 
+def _token_matches(token: Optional[str], expected: str) -> bool:
+    """Whether a header carries the expected secret. Constant-time, and
+    compared as bytes: `secrets.compare_digest` raises on a str that is not
+    ASCII, which turned a header with one odd character into a 500."""
+    return bool(token) and secrets.compare_digest(
+        token.encode("utf-8"), expected.encode("utf-8")
+    )
+
+
 def _check_token(token: Optional[str]) -> None:
     """If WEB_API_TOKEN is set, require it on mutating endpoints."""
     expected = settings.web_api_token
     if not expected:
         return
-    if not token or token != expected:
+    if not _token_matches(token, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing token"
         )
@@ -49,9 +58,7 @@ def _check_read_token(token: Optional[str]) -> None:
         raise HTTPException(
             status_code=404, detail="disabled (WEB_API_TOKEN not set)"
         )
-    if not token or not secrets.compare_digest(
-        token.encode("utf-8"), expected.encode("utf-8")
-    ):
+    if not _token_matches(token, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing token"
         )
@@ -180,7 +187,7 @@ def _check_home_token(token: Optional[str]) -> None:
         raise HTTPException(
             status_code=404, detail="home fetcher disabled (HOME_FETCH_TOKEN not set)"
         )
-    if not token or not secrets.compare_digest(token, expected):
+    if not _token_matches(token, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing token"
         )
@@ -325,7 +332,9 @@ async def telegram_webhook(
     handled by python-telegram-bot's own error handlers.
     """
     expected_secret = settings.telegram_webhook_secret
-    if expected_secret and x_telegram_bot_api_secret_token != expected_secret:
+    if expected_secret and not _token_matches(
+        x_telegram_bot_api_secret_token, expected_secret
+    ):
         logger.warning("Rejected webhook with bad/missing secret header")
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid secret")
 

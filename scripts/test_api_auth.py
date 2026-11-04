@@ -107,6 +107,24 @@ async def test_monitoring_data_needs_the_token() -> None:
             expect("and /status still reports the commit",
                    r.status_code == 200 and r.json().get("commit") == "9af3089", r.text[:120])
 
+            # The mutation endpoints share the comparison: a wrong or non-ASCII
+            # token is refused there too, and never reaches the handler.
+            for path in ("/sweep", "/accounts/watched_one/recheck"):
+                for header in ("wrong", b"s\xe9krit"):
+                    r = await client.post(path, headers={"X-API-Token": header})
+                    expect(f"POST {path} with a bad token {header!r} is a 401",
+                           r.status_code == 401, f"{r.status_code} {r.text[:80]}")
+
+            old_home = settings.home_fetch_token
+            settings.home_fetch_token = "phone-secret"
+            try:
+                r = await client.get("/home-fetch/jobs?wait=0",
+                                     headers={"X-Watcher-Token": b"ph\xf6ne"})
+                expect("the home fetcher refuses a non-ASCII token with a 401, not a 500",
+                       r.status_code == 401, f"{r.status_code} {r.text[:80]}")
+            finally:
+                settings.home_fetch_token = old_home
+
             for token in (None, "sekrit"):
                 settings.web_api_token = token
                 r = await client.get("/health")
