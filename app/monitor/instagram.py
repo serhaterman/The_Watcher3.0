@@ -898,13 +898,26 @@ class InstagramClient:
                         )
 
                 if response.status_code == 404:
-                    fetch_health.record_status(IG_PROFILE, 404)
-                    return ProfileFetchResult(
-                        username=username,
-                        http_status=404,
-                        error="User not found",
-                        api_status=404,
+                    # Not an answer any more. Since 2026-11-04 this API
+                    # returns 404 — an HTML "Page Not Found" — for EVERY
+                    # username, @instagram included (measured through the
+                    # Worker that day). Handed up as "User not found", it kept
+                    # the page doors from ever being asked and sent live
+                    # accounts "not found" alerts, two sweeps running. So it
+                    # is booked as the refusal it is, like a 401: the page
+                    # doors are asked below, and only they (a profile, or the
+                    # page's own 404) or the numeric-id route may say an
+                    # account is gone. No re-ask — it answers the same at once.
+                    logger.warning(
+                        "HTTP 404 on @{} from the username API — its answer for "
+                        "every username now, so not a verdict", username,
                     )
+                    last_status = 401  # stands in for the refusal it is
+                    last_error = (
+                        "HTTP 404 from the username API (its answer for every "
+                        "username now, so not a verdict)"
+                    )
+                    break
 
                 if response.status_code == 429:
                     delay = min(60.0, (2 ** attempt) * 4.0 + jitter)
