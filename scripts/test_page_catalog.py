@@ -42,6 +42,7 @@ if DB_FILE.exists():
     DB_FILE.unlink()
 os.environ.setdefault("DATABASE_URL", f"sqlite+aiosqlite:///{DB_FILE.as_posix()}")
 
+from app.config import settings  # noqa: E402
 from app.database import crud  # noqa: E402
 from app.database.models import Base, MonitoredAccount  # noqa: E402
 from app.database.session import engine, get_session  # noqa: E402
@@ -50,6 +51,7 @@ from app.monitor.instagram import (  # noqa: E402
 )
 from app.monitor.public_page import parse_public_profile  # noqa: E402
 from app.monitor.service import MonitorService  # noqa: E402
+from app.monitor.stories import StoryItem  # noqa: E402
 from app.utils.logger import logger  # noqa: E402
 
 FAILURES: list[str] = []
@@ -233,6 +235,9 @@ class RecordingStories:
     def refusal_since(self, since):
         return None
 
+    def highlight_failure_since(self, since):
+        return None
+
 
 def _service(instagram, *, stories=None) -> MonitorService:
     notifier = AsyncMock()
@@ -414,6 +419,76 @@ async def test_the_download_panel_uses_the_catalog_its_page_read_carried() -> No
            repr((ig.reel_calls, ig.page_calls)))
 
 
+class ListingStories(RecordingStories):
+    """Highlight reels whose items a test scripts, reel by reel."""
+
+    def __init__(self, items_by_reel: dict[str, list[str]]) -> None:
+        super().__init__()
+        self.items_by_reel = items_by_reel
+
+    async def fetch_highlight_items(self, username, highlight_id, title):
+        return [
+            StoryItem(pk=pk, taken_at=0, media_type="image",
+                      url=f"https://scontent.cdninstagram.com/v/{pk}.jpg", source="highlight",
+                      highlight_id=highlight_id, highlight_title=title)
+            for pk in self.items_by_reel.get(highlight_id, [])
+        ]
+
+
+async def test_highlight_media_coming_back_is_no_flood() -> None:
+    """2026-11-05: highlight media came back (storynavigation) after two weeks
+    of none, with item ids that need not match the ones recorded before. A
+    reel already in the catalog has its first listing recorded quietly; a reel
+    new to the catalog is news, however many of its listings fail first."""
+    old_interval = settings.highlight_scan_interval
+    settings.highlight_scan_interval = 0  # every check re-lists every reel
+    try:
+        account_id = await _new_account("quietreels", "4301")
+        async with get_session() as session:
+            await crud.replace_highlight_catalog(session, account_id, {"h1": "Trips", "h3": "Pets"})
+            await crud.mark_story_items_seen(session, account_id, [StoryItem(
+                pk="saveinsta-era", taken_at=0, media_type="image", url="x",
+                source="highlight", highlight_id="h1")])
+        stories = ListingStories({"h1": ["p1", "p2"], "h2": [], "h3": []})
+        service = _service(ScriptedInstagram(), stories=stories)
+        delivered: list[str] = []
+
+        async def deliver(account_id, username, items, seen, **kw):
+            delivered.extend(item.pk for item in items)
+            return len(items)
+
+        service._deliver_story_items = deliver  # type: ignore[method-assign]
+
+        async def check() -> None:
+            await service._check_stories_and_highlights(
+                account_id, "quietreels", instagram_id="4301", catalog_due=True,
+                reel_data={
+                    "has_public_story": False, "is_live": False, "from_page": True,
+                    "highlights": {"h1": "Trips", "h2": "New", "h3": "Pets"},
+                },
+            )
+
+        await check()
+        async with get_session() as session:
+            seen = await crud.get_seen_story_pks(session, account_id)
+            pending = await crud.get_setting(session, f"highlight_quiet_reels:{account_id}")
+        expect("a pre-existing reel's first listing delivers nothing", delivered == [], repr(delivered))
+        expect("but records its items as seen", {"p1", "p2"} <= set(seen), repr(seen))
+        expect("an old reel not served yet still owes its quiet listing",
+               json.loads(pending or "null") == ["h3"], repr(pending))
+
+        stories.items_by_reel = {"h1": ["p1", "p2", "p3"], "h2": ["n1"], "h3": ["q1"]}
+        await check()
+        expect("then an item added to that reel is delivered", "p3" in delivered, repr(delivered))
+        expect("so is the new reel's media, though its first listing failed",
+               "n1" in delivered, repr(delivered))
+        expect("while the other old reel's first listing stays quiet",
+               "q1" not in delivered, repr(delivered))
+        expect("and nothing else is delivered", sorted(delivered) == ["n1", "p3"], repr(delivered))
+    finally:
+        settings.highlight_scan_interval = old_interval
+
+
 async def main() -> int:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -428,6 +503,7 @@ async def main() -> int:
     await test_a_sweep_reads_catalogs_and_empty_grids_from_the_page()
     await test_the_card_asks_the_page_before_the_refused_reel_query()
     await test_the_download_panel_uses_the_catalog_its_page_read_carried()
+    await test_highlight_media_coming_back_is_no_flood()
 
     await engine.dispose()
     print()

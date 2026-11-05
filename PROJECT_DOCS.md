@@ -163,7 +163,8 @@ the_watcher_V3.0/
 │   │   ├── media_hasher.py  # Download & hash profile pictures
 │   │   ├── service.py       # MonitorService — orchestrate fetch/diff/persist/notify
 │   │   ├── change_detector.py # ChangeSet diffing logic
-│   │   └── stories.py       # StoriesClient — stories & highlights
+│   │   ├── stories.py       # StoriesClient — stories & highlights
+│   │   └── storynavigation.py # Highlight media, fresh copies only
 │   ├── workers/
 │   │   └── scheduler.py     # WatcherScheduler (APScheduler wrapper)
 │   └── utils/
@@ -563,6 +564,30 @@ POST saveinsta.to/api/ajaxSearch  -> returns media HTML for the target URL
 Instagram's own gate, so it keeps working when the API path is 401-blocked.
 During an outage the story media still arrives; only the live *status* goes
 unknown, and the bot says so rather than guessing.
+
+**Highlight media: storynavigation.com, fresh copies only (2026-11-05).**
+saveinsta has answered "Video is private." for every highlight since
+2026-10-23, so `fetch_highlight_items` asks `app/monitor/storynavigation.py`
+first and saveinsta only when that gives nothing. storynavigation's page posts
+`{highlightId}` to `/get-highlight-stories` with the Laravel CSRF token from its
+home page (no captcha, no login of ours) and gets the reel's items as Instagram
+CDN links. Measured the same day: the first request for a reel fetches it from
+Instagram (3.5–13 s; about half of those fetches fail with an empty body), and
+whatever came back — items, or `[]` — is then served from storage for a day or
+more (0.2–0.33 s, identical signed links). Under the no-stale-data rule an
+answer counts only when it took seconds (≥ 2.5 s: this request fetched it), or
+when it is the copy this client fetched live within the last 15 minutes. A
+quick answer is refused as "only had a stored copy", an empty one as "sent
+nothing for this highlight" — never as an empty highlight — and the download
+error names every source's reason. Its own highlight list and profile data are
+never used: the list said `[]` for an account with three reels, and profiles
+are cached (natgeo's follower count did not move in 10 minutes).
+
+When highlight media came back, every reel already in a catalog was owed one
+quiet first listing (`highlight_quiet_reels:<id>`): its items are recorded as
+seen, not delivered, because two weeks of reels had no media and the ids
+recorded before came from saveinsta's links. A reel that joins the catalog
+later is always delivered, however many of its listings fail first.
 
 ### 6.7 Cloudflare Worker Proxy
 

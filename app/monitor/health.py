@@ -21,8 +21,9 @@ from typing import Deque, Optional
 IG_PROFILE = "ig_profile"   # web_profile_info (the main per-account fetch)
 IG_REEL = "ig_reel"         # graphql reel query (story/live status + highlights)
 SAVEINSTA = "saveinsta"     # anonymous story/post/highlight media source
+STORYNAV = "storynavigation"  # anonymous highlight media (since 2026-11-05)
 
-_ENDPOINTS = (IG_PROFILE, IG_REEL, SAVEINSTA)
+_ENDPOINTS = (IG_PROFILE, IG_REEL, SAVEINSTA, STORYNAV)
 
 # Outcome categories.
 OK = "ok"
@@ -147,6 +148,7 @@ def render_health_lines(snapshot: dict) -> list[str]:
         IG_PROFILE: "Profile API",
         IG_REEL: "Reel query",
         SAVEINSTA: "saveinsta",
+        STORYNAV: "storynavigation",
     }
     lines: list[str] = []
     endpoints = snapshot.get("endpoints", {})

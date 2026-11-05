@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import random
 import re
 import time
@@ -199,6 +200,15 @@ def _is_stale_pic(
     if now - since > _STALE_PIC_WINDOW:
         return False
     return current_asset in {pic_asset_id(url) for url, _at in older}
+
+
+def _json_ids(raw: Optional[str]) -> set[str]:
+    """A stored JSON list of ids as a set; an unreadable one as empty."""
+    try:
+        value = json.loads(raw) if raw else []
+    except ValueError:
+        return set()
+    return {str(v) for v in value} if isinstance(value, list) else set()
 
 
 def _parse_utc(raw: Optional[str]) -> Optional[datetime]:
@@ -3136,11 +3146,12 @@ class MonitorService:
     ) -> list:
         """Download story items across every highlight reel in the catalog.
 
-        The reel ids come from Instagram's graphql query (anonymous); the media
-        itself comes from saveinsta.to per reel. Failures on individual reels are
-        swallowed so one bad reel never sinks the rest. When `cancellable`, a
-        /kill aborts the in-flight reel fetches and returns nothing — so a huge
-        catalog can be stopped before the (longer) delivery phase even begins.
+        The reel ids come from Instagram's own catalog; the media itself comes
+        per reel from storynavigation (fresh copies only), else saveinsta.
+        Failures on individual reels are swallowed so one bad reel never sinks
+        the rest. When `cancellable`, a /kill aborts the in-flight reel fetches
+        and returns nothing — so a huge catalog can be stopped before the
+        (longer) delivery phase even begins.
         """
         if self.stories is None or not catalog:
             return []
@@ -3186,15 +3197,27 @@ class MonitorService:
         return items
 
     def _media_unavailable(self, since: float) -> str:
-        """The error for a download saveinsta sent nothing for, `since` being
-        when the download started. When saveinsta said why, pass its words on;
-        guessing at a rate limit hid that it had stopped serving highlights
-        ("Video is private." for every public account)."""
-        reason = self.stories.refusal_since(since) if self.stories else None
-        if reason is None:
+        """The error for a download no anonymous source served, `since` being
+        when the download started. Every source that said why is quoted:
+        guessing at a rate limit hid that saveinsta had stopped serving
+        highlights ("Video is private." for every public account), and
+        storynavigation's usual reason is that it only had an old copy."""
+        if self.stories is None:
             return _DOWNLOAD_UNAVAILABLE_MSG
+        reasons = []
+        storynav = self.stories.highlight_failure_since(since)
+        if storynav:
+            reasons.append(f"storynavigation {storynav}")
+        refusal = self.stories.refusal_since(since)
+        if refusal:
+            reasons.append(f"saveinsta refused it: “{refusal}”")
+        if not reasons:
+            return _DOWNLOAD_UNAVAILABLE_MSG
+        text = "; ".join(reasons)
+        if not text.endswith(("”", ".")):
+            text += "."
         return (
-            f"saveinsta, the anonymous media source, refused it: “{reason}” "
+            f"No anonymous source served it — {text} "
             "Highlight names and story status still work."
         )
 
@@ -3235,6 +3258,57 @@ class MonitorService:
     @staticmethod
     def _highlight_scan_key(account_id: int) -> str:
         return f"highlight_scan:{account_id}"
+
+    @staticmethod
+    def _quiet_reels_key(account_id: int) -> str:
+        return f"highlight_quiet_reels:{account_id}"
+
+    async def _hold_back_first_listings(
+        self,
+        account_id: int,
+        username: str,
+        items: list,
+        previous_catalog: dict[str, str],
+        catalog: dict[str, str],
+    ) -> set[str]:
+        """The reels of `items` that were in the catalog when highlight media
+        came back (storynavigation, 2026-11-05) and are listed for the first
+        time since: their items are recorded as seen, not delivered — the way
+        an account's first sweep is a baseline. Returns those reel ids.
+
+        No highlight item could be listed for two weeks before that, and the
+        ids recorded earlier came from saveinsta's links, which need not match
+        storynavigation's: without this, a reel's first listing would deliver
+        its old media as if new. A reel that joins the catalog later is news
+        and is delivered, however many of its listings fail first
+        (storynavigation fails about half of its fetches).
+        """
+        key = self._quiet_reels_key(account_id)
+        async with get_session() as session:
+            raw = await crud.get_setting(session, key)
+        # The first time through: the reels the account had until this check.
+        pending = _json_ids(raw) if raw is not None else set(previous_catalog)
+        listed = {item.highlight_id for item in items if item.highlight_id}
+        held = listed & pending
+        remaining = pending - listed
+        if catalog:
+            remaining &= set(catalog)  # a deleted reel needs no quiet listing
+        if raw is None or remaining != pending:
+            async with get_session() as session:
+                if held:
+                    await crud.mark_story_items_seen(
+                        session, account_id,
+                        [item for item in items if item.highlight_id in held],
+                    )
+                await crud.set_setting(session, key, json.dumps(sorted(remaining)))
+        if held:
+            logger.info(
+                "@{}: first listing of {} reel(s) since highlight media came back "
+                "— their {} item(s) recorded as seen, not delivered",
+                username, len(held),
+                sum(1 for item in items if item.highlight_id in held),
+            )
+        return held
 
     @classmethod
     def _highlight_scan_overdue(
@@ -3621,6 +3695,11 @@ class MonitorService:
                             self._highlight_scan_key(account_id),
                             str(time.time()),
                         )
+                        # Everything listed is seen already, so no reel is
+                        # left owing a quiet first listing.
+                        await crud.set_setting(
+                            session, self._quiet_reels_key(account_id), "[]"
+                        )
                     logger.info(
                         "Established story/highlight baseline for @{} ({} reels, {} items)",
                         username,
@@ -3695,8 +3774,12 @@ class MonitorService:
                             self._highlight_scan_key(account_id),
                             str(time.time()),
                         )
+                held = await self._hold_back_first_listings(
+                    account_id, username, highlight_items, previous_catalog, catalog
+                )
                 new_highlight_items = [
-                    i for i in highlight_items if i.pk and i.pk not in seen_pks
+                    i for i in highlight_items
+                    if i.pk and i.pk not in seen_pks and i.highlight_id not in held
                 ]
                 if new_highlight_items:
                     await self._deliver_story_items(
@@ -4527,7 +4610,7 @@ class MonitorService:
             }
 
         highlight_id, title = items[index]
-        # Anonymous media fetch (no login) via saveinsta.to.
+        # Anonymous media fetch (no login): storynavigation, else saveinsta.
         since = time.monotonic()
         try:
             story_items = await self.stories.fetch_highlight_items(

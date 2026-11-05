@@ -111,6 +111,9 @@ class SlowStories:
     def refusal_since(self, since):
         return None
 
+    def highlight_failure_since(self, since):
+        return None
+
 
 def _service(instagram, *, stories=None) -> MonitorService:
     notifier = AsyncMock()

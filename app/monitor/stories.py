@@ -18,6 +18,10 @@ impersonation is required — a plain Python TLS stack gets blocked.
 Like any third-party source this can break or rate-limit; every method degrades
 gracefully (returns [] / None) so a dead source never breaks the sweep, and the
 graphql story/live status + highlight-name detection stays the reliable signal.
+
+Highlight media come from storynavigation.com first (storynavigation.py,
+fresh copies only): saveinsta has answered "Video is private." for every
+highlight since 2026-10-23 and is asked only when storynavigation has nothing.
 """
 
 from __future__ import annotations
@@ -38,6 +42,7 @@ from curl_cffi.requests import AsyncSession
 
 from app.config import settings
 from app.monitor.health import SAVEINSTA, fetch_health
+from app.monitor.storynavigation import StoryNavigation
 from app.utils.logger import logger
 from app.utils.downloads import RefusedURL, account_media_dir, fetch_public
 
@@ -77,7 +82,7 @@ class StoryItem:
     pk: str
     taken_at: int           # unix timestamp (0 when the source omits it)
     media_type: str         # "image" or "video"
-    url: str                # dl.snapcdn.app download link
+    url: str                # dl.snapcdn.app link, or an Instagram CDN URL
     source: str             # "story" or "highlight"
     highlight_id: Optional[str] = None
     highlight_title: Optional[str] = None
@@ -106,6 +111,8 @@ class StoriesClient:
         # (monotonic time, reason) of the last request saveinsta refused, so a
         # caller left with no media can say why — see refusal_since.
         self._last_refusal: Optional[tuple[float, str]] = None
+        # Highlight media, asked before saveinsta (see fetch_highlight_items).
+        self._storynav = StoryNavigation()
 
     async def close(self) -> None:
         await self._session.close()
@@ -134,13 +141,20 @@ class StoriesClient:
     ) -> list[StoryItem]:
         """Return the story items for one highlight reel (login-free).
 
-        `highlight_id` is the numeric id from Instagram's graphql reel query; the
-        saveinsta endpoint expects it as /stories/highlights/<id>/.
+        `highlight_id` is the numeric id from Instagram's own catalog.
+        storynavigation is asked first and serves fresh copies only; saveinsta
+        (which expects the id as /stories/highlights/<id>/) only when that
+        gives nothing — it has refused every highlight since 2026-10-23, and
+        stays asked in case it serves them again.
         """
         numeric = str(highlight_id).split(":")[-1]
-        url = f"https://www.instagram.com/stories/highlights/{numeric}/"
-        data = await self._fetch_media_html(url)
-        items = self._parse_items(data, source="highlight")
+        items = self._storynav_items(
+            await self._storynav.highlight_media(self._session, numeric)
+        )
+        if not items:
+            url = f"https://www.instagram.com/stories/highlights/{numeric}/"
+            data = await self._fetch_media_html(url)
+            items = self._parse_items(data, source="highlight")
         for item in items:
             item.highlight_id = highlight_id
             item.highlight_title = title
@@ -247,6 +261,12 @@ class StoriesClient:
         if self._last_refusal is not None and self._last_refusal[0] >= since:
             return self._last_refusal[1]
         return None
+
+    def highlight_failure_since(self, since: float) -> Optional[str]:
+        """Why storynavigation served no highlight asked at or after `since`
+        (a time.monotonic() value); None when it served every one, or was not
+        asked."""
+        return self._storynav.failure_since(since)
 
     async def resolve_user_id(self, username: str) -> Optional[str]:
         """Deprecated PK lookup. saveinsta works off URLs, not numeric ids, and
@@ -409,6 +429,25 @@ class StoriesClient:
                     media_type="video" if is_video else "image",
                     url=href,
                     source=source,
+                )
+            )
+        return items
+
+    def _storynav_items(self, media: list[tuple[str, str]]) -> list[StoryItem]:
+        """storynavigation's (type, Instagram CDN URL) pairs as highlight
+        items, de-duplicated and keyed like saveinsta's: by the media id in
+        the CDN path."""
+        items: list[StoryItem] = []
+        seen: set[str] = set()
+        for media_type, url in media:
+            pk = self._derive_pk(url, url)
+            if pk in seen:
+                continue
+            seen.add(pk)
+            items.append(
+                StoryItem(
+                    pk=pk, taken_at=0, media_type=media_type, url=url,
+                    source="highlight",
                 )
             )
         return items

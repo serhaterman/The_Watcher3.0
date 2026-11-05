@@ -105,6 +105,9 @@ class QuietStories:
     def refusal_since(self, since):
         return None
 
+    def highlight_failure_since(self, since):
+        return None
+
 
 def _service(*, stories=None) -> MonitorService:
     notifier = AsyncMock()
