@@ -21,6 +21,8 @@ if str(ROOT) not in sys.path:
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "x")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "1")
+# The fake user (99) drives the handlers as an admin, as a real one would.
+os.environ.setdefault("TELEGRAM_ADMIN_IDS", "99")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 from app.bot import handlers, keyboards  # noqa: E402

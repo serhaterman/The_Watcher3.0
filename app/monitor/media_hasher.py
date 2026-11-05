@@ -17,6 +17,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 from app.config import settings
 from app.utils.logger import logger
+from app.utils.downloads import RefusedURL, account_media_dir, fetch_public
 
 CHROME_IMPERSONATE = "chrome120"
 
@@ -248,13 +249,20 @@ class MediaHasher:
     async def _fetch_and_store(self, url: str, username: str) -> Optional[HashedMedia]:
         """Download one URL, hash it, and persist to disk."""
         try:
-            response = await self._client.get(
+            response = await fetch_public(
+                self._client,
                 url,
                 headers={
                     "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
                     "Referer": "https://www.instagram.com/",
                 },
             )
+        except RefusedURL as exc:
+            # Avatar URLs come from Instagram's payloads and saveinsta's
+            # HTML: never let one lead the client to a local file or this
+            # host's own network.
+            logger.warning("Not downloading a picture for @{}: {}", username, exc)
+            return None
         except RequestException as exc:
             logger.warning("Failed to download profile picture for @{}: {}", username, exc)
             return None
@@ -268,7 +276,7 @@ class MediaHasher:
 
         content = response.content
         ext = _ext_from_content_type(response.headers.get("Content-Type", "")) or ".jpg"
-        account_dir = settings.media_path / username
+        account_dir = account_media_dir(username)
 
         def _persist() -> tuple[str, Path, Optional[str]]:
             # SHA256 + disk write + PIL decode/resize/hash are all CPU/disk

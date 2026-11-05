@@ -206,12 +206,36 @@ _INTERVAL_RE = re.compile(
 
 # ---------- Authorization ----------
 
+def _configured_chat_ids() -> set[int]:
+    """The chats the bot reports to: TELEGRAM_CHAT_ID and the mirrors (an
+    "@channel" name cannot match an update's numeric id, so it is skipped)."""
+    ids = {settings.telegram_chat_id, *settings.mirror_chat_ids}
+    return {int(i) for i in ids if str(i).lstrip("-").isdecimal()}
+
+
+def describe_access() -> str:
+    """Who may drive the bot, in words, for the startup log."""
+    if settings.admin_ids:
+        count = len(settings.admin_ids)
+        return f"TELEGRAM_ADMIN_IDS ({count} id{'s' if count != 1 else ''})"
+    count = len(_configured_chat_ids())
+    return (
+        f"the {count} chat{'s' if count != 1 else ''} notifications go to "
+        "(TELEGRAM_CHAT_ID and mirrors) — set TELEGRAM_ADMIN_IDS to name people"
+    )
+
+
 def _is_authorized(update: Update) -> bool:
-    admins = settings.admin_ids
-    if not admins:
-        return True
+    """Whether this update may drive the bot.
+
+    With TELEGRAM_ADMIN_IDS set, those users and chats. Without it the bot
+    used to answer ANYONE who found it — list, add and remove targets, run
+    sweeps, download media. It now answers the chats it reports to and
+    nobody else; set TELEGRAM_ADMIN_IDS to name people instead.
+    """
     user = update.effective_user
     chat = update.effective_chat
+    admins = settings.admin_ids or _configured_chat_ids()
     if user and user.id in admins:
         return True
     if chat and chat.id in admins:
@@ -222,10 +246,20 @@ def _is_authorized(update: Update) -> bool:
 async def _reject_if_unauthorized(update: Update) -> bool:
     if _is_authorized(update):
         return False
+    text = "Unauthorized."
+    chat, user = update.effective_chat, update.effective_user
+    if not settings.admin_ids and chat and user and chat.type == "private":
+        # The default lets in only the chats the bot reports to, which can
+        # leave its owner refused in a DM. Say how to get in from here: only
+        # the owner can act on it, and the id shown is the reader's own.
+        text = (
+            "Unauthorized. This bot answers only the chats it reports to. To use "
+            f"it here, add your Telegram id {user.id} to TELEGRAM_ADMIN_IDS."
+        )
     if update.callback_query:
-        await update.callback_query.answer("Unauthorized.", show_alert=True)
+        await update.callback_query.answer(text, show_alert=True)
     elif update.message:
-        await update.message.reply_text("Unauthorized.")
+        await update.message.reply_text(text)
     return True
 
 
@@ -239,7 +273,9 @@ def _username_arg(context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
 
 def _normalize_username(raw: str) -> Optional[str]:
     raw = raw.strip().lstrip("@")
-    if not raw or not _USERNAME_RE.match(raw):
+    # Dots alone ("." or "..") match the pattern but are no Instagram handle
+    # — and ".." named the folder above the media root.
+    if not raw or not _USERNAME_RE.match(raw) or not raw.strip("."):
         return None
     return raw.lower()
 

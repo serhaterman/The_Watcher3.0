@@ -6,6 +6,7 @@ notification dispatcher, change detection engine, and APScheduler-driven worker.
 
 from __future__ import annotations
 
+import secrets
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -18,6 +19,7 @@ from app.bot.handlers import (
     BOT_COMMANDS,
     PANEL_CHAT_ID,
     PANEL_MSG_ID,
+    describe_access,
     instagram_route,
     register_handlers,
 )
@@ -33,6 +35,23 @@ from app.monitor.service import MonitorService
 from app.monitor.stories import StoriesClient
 from app.utils.logger import logger, quiet_health_check_logs
 from app.workers.scheduler import WatcherScheduler
+
+
+def ensure_webhook_secret() -> None:
+    """Give the webhook a secret when none is configured.
+
+    Without one the webhook took ANY post as Telegram's — and an update says
+    which user sent it, admins included. A random secret for this run is
+    registered with setWebhook and checked on every post (see
+    routes.telegram_webhook). Render generates TELEGRAM_WEBHOOK_SECRET
+    (render.yaml); this covers every other deployment."""
+    if settings.telegram_webhook_secret:
+        return
+    settings.telegram_webhook_secret = secrets.token_urlsafe(32)
+    logger.warning(
+        "TELEGRAM_WEBHOOK_SECRET is not set — using a random one for this run, "
+        "so the webhook only accepts Telegram's own posts"
+    )
 
 
 @asynccontextmanager
@@ -70,6 +89,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         .build()
     )
     register_handlers(tg_app)
+    logger.info("Telegram access: {}", describe_access())
 
     # Build core services
     instagram = InstagramClient()
@@ -135,6 +155,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     if settings.telegram_use_webhook:
         webhook_url = settings.telegram_webhook_full_url
+        ensure_webhook_secret()
         # Drop the webhook first so any prior URL/secret is cleared, then
         # register ours. `drop_pending_updates` discards the backlog that
         # built up while polling was running, preventing a flood at switchover.

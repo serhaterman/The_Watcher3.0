@@ -39,6 +39,7 @@ from curl_cffi.requests import AsyncSession
 from app.config import settings
 from app.monitor.health import SAVEINSTA, fetch_health
 from app.utils.logger import logger
+from app.utils.downloads import RefusedURL, account_media_dir, fetch_public
 
 _BASE = "https://saveinsta.to"
 _TOKEN_PAGE = f"{_BASE}/en/highlights"
@@ -207,7 +208,7 @@ class StoriesClient:
     async def download(self, item: StoryItem, username: str) -> Optional[Path]:
         """Download a story item to disk. Returns the local path on success."""
         ext = ".mp4" if item.media_type == "video" else ".jpg"
-        dest_dir = settings.media_path / username / "stories"
+        dest_dir = account_media_dir(username) / "stories"
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / f"{item.pk}{ext}"
 
@@ -215,7 +216,7 @@ class StoriesClient:
             return dest
 
         try:
-            resp = await self._session.get(item.url)
+            resp = await fetch_public(self._session, item.url)
             if resp.status_code != 200 or not resp.content:
                 logger.warning(
                     "Bad story download for @{} pk={}: status={}",
@@ -226,6 +227,13 @@ class StoriesClient:
             # bulk download never freezes the bot's handlers mid-write.
             await asyncio.to_thread(dest.write_bytes, resp.content)
             return dest
+        except RefusedURL as exc:
+            # The link came from saveinsta's HTML: never let it lead the
+            # client to a local file or this host's own network.
+            logger.warning(
+                "Not downloading story {} for @{}: {}", item.pk, username, exc
+            )
+            return None
         except Exception as exc:
             logger.warning(
                 "Failed to download story {} for @{}: {}", item.pk, username, exc

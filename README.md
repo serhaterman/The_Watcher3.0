@@ -263,7 +263,7 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 
 | Variable | Default | Description |
 |---|---|---|
-| `TELEGRAM_ADMIN_IDS` | _(empty)_ | Comma-separated user IDs allowed to use the bot. Empty = allow all |
+| `TELEGRAM_ADMIN_IDS` | _(empty)_ | Comma-separated user IDs allowed to use the bot. Empty = only the chats the bot reports to (`TELEGRAM_CHAT_ID` and the mirrors) |
 | `TELEGRAM_WEBHOOK_URL` | _(empty)_ | Public base URL for webhook registration. Auto-inferred from `RENDER_EXTERNAL_URL` on Render |
 | `TELEGRAM_WEBHOOK_SECRET` | _(empty)_ | Optional secret validated against Telegram's `X-Telegram-Bot-Api-Secret-Token` header |
 | `TELEGRAM_WEBHOOK_PATH` | `/telegram/webhook` | Webhook path registered with Telegram and mounted by FastAPI |
@@ -354,7 +354,7 @@ The story/live status is reported from live reel data only — never re-read fro
 
 | Variable | Default | Description |
 |---|---|---|
-| `WEB_API_TOKEN` | _(empty)_ | Sent as the `X-API-Token` header. Required for `/status` and `/accounts`, which are disabled while it is unset; if set, also required for `/sweep` and `/accounts/*/recheck` |
+| `WEB_API_TOKEN` | _(empty)_ | Sent as the `X-API-Token` header. Required for `/status`, `/accounts`, `/sweep` and `/accounts/*/recheck`, which are all disabled while it is unset |
 | `PORT` | `8000` | Web server port |
 | `LOG_LEVEL` | `INFO` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
@@ -409,7 +409,7 @@ The story/live status is reported from live reel data only — never re-read fro
 
 ## 🔌 HTTP API
 
-All responses are JSON. Endpoints marked **Token** take the `X-API-Token` header. `/status` and `/accounts` expose what is being monitored, so they always need it and answer 404 while `WEB_API_TOKEN` is unset. The two mutation endpoints need it whenever it is configured.
+All responses are JSON. Endpoints marked **Token** take the `X-API-Token` header. They all answer 404 while `WEB_API_TOKEN` is unset: `/status` and `/accounts` expose what is being monitored, and `/sweep` would let anyone fire sweeps at Instagram.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
@@ -455,7 +455,8 @@ app/
 ├── database/       SQLAlchemy models, async session, CRUD helpers
 ├── monitor/        Instagram client, public-page fallback parser, anonymous media
 │                   downloader, change detector, perceptual hashing, sweep orchestrator
-├── utils/          Logging setup, formatting helpers, background tasks
+├── utils/          Logging setup, formatting helpers, background tasks, the download
+│                   guard (media folders; public http(s) hosts only, every hop)
 ├── workers/        APScheduler-based sweep worker
 ├── config.py       Pydantic Settings — environment-driven configuration
 └── main.py         FastAPI app, lifespan wiring, service initialization

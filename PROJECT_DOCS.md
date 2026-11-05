@@ -167,6 +167,7 @@ the_watcher_V3.0/
 │   ├── workers/
 │   │   └── scheduler.py     # WatcherScheduler (APScheduler wrapper)
 │   └── utils/
+│       ├── downloads.py     # Media folders + fetch_public: public http(s) hosts only, every hop
 │       ├── formatting.py    # fmt_timestamp (Damascus UTC+3), fmt_number, esc, truncate
 │       ├── logger.py        # Loguru logger
 │       └── tasks.py         # spawn(): background work that is held and reports itself
@@ -953,7 +954,9 @@ few requests; the media itself flows entirely through saveinsta.
 ### Authorization
 
 When `TELEGRAM_ADMIN_IDS` is set, only those Telegram user IDs can interact
-with the bot. When unset, any user can interact (suitable for personal use).
+with the bot. When unset, only the chats it reports to (`TELEGRAM_CHAT_ID` and
+the mirrors) can — until 2026-11-05 it answered anyone who found it. The
+startup log says which applies (`Telegram access: …`).
 
 ---
 
@@ -961,9 +964,9 @@ with the bot. When unset, any user can interact (suitable for personal use).
 
 All endpoints are under the FastAPI app. The token is `WEB_API_TOKEN`, sent
 as the `X-API-Token` header. The two read endpoints that expose what is being
-monitored always need it and answer 404 while it is unset (until 2026-11-05
-`/accounts` listed every monitored username to anyone with the URL). The two
-mutation endpoints need it whenever it is configured.
+monitored, and the two that act, all need it and answer 404 while it is unset
+(until 2026-11-05 `/accounts` listed every monitored username to anyone with
+the URL, and `/sweep` ran for anyone on a deployment without a token).
 
 | Method | Path | Token | Description |
 |---|---|---|---|
@@ -997,7 +1000,7 @@ All settings are read from environment variables (or a `.env` file locally).
 | `TELEGRAM_WEBHOOK_URL` | — | Public base URL for webhook (auto-set by Render via `RENDER_EXTERNAL_URL`) |
 | `TELEGRAM_WEBHOOK_SECRET` | — | Webhook secret token — disallowed characters are stripped automatically |
 | `TELEGRAM_WEBHOOK_PATH` | `/telegram/webhook` | Webhook path |
-| `TELEGRAM_ADMIN_IDS` | — | Comma-separated Telegram user IDs allowed to use the bot |
+| `TELEGRAM_ADMIN_IDS` | — | Comma-separated Telegram user IDs allowed to use the bot; empty = only the chats it reports to |
 
 ### Instagram
 
@@ -1062,7 +1065,7 @@ All settings are read from environment variables (or a `.env` file locally).
 | Env Var | Default | Description |
 |---|---|---|
 | `MEDIA_DIR` | `./data/media` | Local directory for downloaded profile pictures |
-| `WEB_API_TOKEN` | — | `X-API-Token` for the HTTP API; `/status` and `/accounts` stay disabled without it |
+| `WEB_API_TOKEN` | — | `X-API-Token` for the HTTP API; every endpoint that needs it stays disabled without it |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `PORT` | `8000` | Web server port (injected by Render automatically) |
 | `PROXY_URL` | — | Optional HTTP/HTTPS/SOCKS5 proxy for all outbound requests. Wins over `HTTP_PROXY`/`HTTPS_PROXY`. Note it wraps the whole session, so with `IG_PROXY_URL` set it applies to the hop that reaches the Worker — not to the Worker's own egress to Instagram |

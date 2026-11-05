@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import random
+import re
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -106,6 +107,10 @@ _SWEEP_BREAKER_MAX_PAUSES = 2
 # A 404 is a real answer (read against the numeric-id route in _do_check and
 # surfaced by _handle_failure), not a block to retry.
 _RETRIABLE_STATUSES = (401, 403, 429, 0)
+
+# What a username may be before it is stored or names a folder: Instagram's
+# alphabet, up to 30 characters (the same rule as the bot's commands).
+_VALID_HANDLE = re.compile(r"[a-z0-9._]{1,30}")
 
 # app_settings key holding when a sweep last found the username API refusing
 # every lookup. Read by the next sweep (one knock instead of a threshold's
@@ -2258,6 +2263,15 @@ class MonitorService:
         new = (new or "").strip().lstrip("@").lower()
         old = (old or "").strip().lstrip("@").lower()
         if not new or new == old:
+            return old
+        if not _VALID_HANDLE.fullmatch(new) or not new.strip("."):
+            # The new name came from Instagram's payload (or the id route's),
+            # not from a validated command: one that is no Instagram handle
+            # is not stored, nor used to name a media folder.
+            logger.warning(
+                "@{}: ignoring a rename to {!r}, which is not an Instagram "
+                "username", old, new,
+            )
             return old
         async with get_session() as session:
             account = await session.get(MonitoredAccount, account_id)

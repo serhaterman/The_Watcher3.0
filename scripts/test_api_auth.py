@@ -2,12 +2,14 @@
 
 Until that day `GET /accounts` answered anyone with the service URL with every
 monitored username, its last check and its failure count, and `GET /status`
-with the account counts and fetch health. Both now need WEB_API_TOKEN, and,
-unlike the mutation endpoints' check, they fail CLOSED: a deployment without
-a token publishes nothing.
+with the account counts and fetch health. Both now need WEB_API_TOKEN, and
+they fail CLOSED: a deployment without a token publishes nothing. So, since
+the security review the same day, do the mutation endpoints (/sweep and the
+recheck), which used to be open to anyone when no token was set.
 
 What must hold:
-- with no token configured, /status and /accounts are disabled (404);
+- with no token configured, /status, /accounts, /sweep and the recheck are
+  disabled (404);
 - with one, a missing or wrong X-API-Token is a 401, never the data, and a
   header that is not ASCII is a 401 too, not a 500;
 - the right token reads both, exactly as before;
@@ -74,6 +76,10 @@ async def test_monitoring_data_needs_the_token() -> None:
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://bot") as client:
             settings.web_api_token = None
+            for path in ("/sweep", "/accounts/watched_one/recheck"):
+                r = await client.post(path)
+                expect(f"no token configured: POST {path} is disabled, not open",
+                       r.status_code == 404, f"{r.status_code} {r.text[:80]}")
             for path in ("/accounts", "/status"):
                 r = await client.get(path)
                 expect(f"no token configured: {path} is disabled",
