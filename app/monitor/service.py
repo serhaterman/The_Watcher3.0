@@ -309,6 +309,9 @@ class _SweepThrottle:
         # Set when the breaker opens, so a check waiting out its gap wakes
         # to be skipped instead of sleeping for a request it won't make.
         self._opened = asyncio.Event()
+        # The page-tunnel exit the last booked check went out through: blocks
+        # are counted per exit (see record).
+        self._page_exit: Optional[str] = None
 
     def is_open(self) -> bool:
         return self._open
@@ -392,6 +395,7 @@ class _SweepThrottle:
         *,
         id_status: Optional[int] = None,
         api_status: Any = _NOT_GIVEN,
+        page_exit: Optional[str] = None,
     ) -> None:
         """Book one check. `status` is the username side's overall answer
         (the API or, failing that, a page door — None when nothing on that
@@ -404,7 +408,23 @@ class _SweepThrottle:
         any route answered is a success for pacing and for the gate. The gate
         is down when Instagram answers NOTHING — not when one of its doors is
         shut, which since 2026-09-05 is the normal state of the username API.
+
+        `page_exit` is the page-tunnel exit the check went out through (None
+        when pages left from this host). Blocks are counted per exit: a new
+        exit starts the count over, since one Instagram refuses says nothing
+        about the next. Measured 2026-11-05: three blocks on one exit and two
+        on the next tripped the breaker before the third exit, which then
+        answered all 17 accounts, was ever tried.
         """
+        if page_exit and page_exit != self._page_exit:
+            if self._page_exit is not None and self._consecutive_auth_fails:
+                logger.info(
+                    "The page tunnel moved on to {} — the sweep counts its "
+                    "blocks afresh there ({} booked on {})",
+                    page_exit, self._consecutive_auth_fails, self._page_exit,
+                )
+                self._consecutive_auth_fails = 0
+            self._page_exit = page_exit
         door = status if api_status is _NOT_GIVEN else api_status
         user_blocked = door in (401, 403)
         user_ok = door == 200
@@ -1820,6 +1840,9 @@ class MonitorService:
             # fetching its own page now, so a handover triggered by its own
             # refusal must not ask the phone for it a second time.
             throttle.note_started(username)
+            # Read before the check: a move the check itself sets off is the
+            # next check's exit, not this one's.
+            page_exit = self._page_exit()
             result = await self._run_check(
                 account_id, username, thorough=False,
                 skip_username_api=throttle.username_door_closed,
@@ -1835,6 +1858,7 @@ class MonitorService:
                 result.get("status"),
                 id_status=result.get("id_status"),
                 api_status=result.get("api_status", _NOT_GIVEN),
+                page_exit=page_exit,
             )
             # The moment to hand the home fetcher the rest of the list is
             # when BOTH username-side doors have failed for this account: the
@@ -1971,6 +1995,16 @@ class MonitorService:
         if recovered:
             logger.info("{} account(s) recovered on retry", recovered)
         return recovered
+
+    @staticmethod
+    def _page_exit() -> Optional[str]:
+        """The page-tunnel exit profile pages leave from now, named for the
+        log ("NL-FREE#158 (185.107.56.154)"); None when they leave from this
+        host."""
+        tunnel = page_tunnel.tunnel
+        if not (tunnel.up and tunnel.egress_ip):
+            return None
+        return f"{tunnel.label} ({tunnel.egress_ip})"
 
     @staticmethod
     def _page_doors_signature() -> tuple[int, bool]:

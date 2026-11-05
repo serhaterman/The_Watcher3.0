@@ -822,13 +822,26 @@ at 0%, a sweep of 13 failures and 4 id-only readings. Now:
   configs all stay silent goes back to the refused one, and on the same IP
   that is not a new route: the cooldown stands. When the tunnel is up and a
   sweep still reads no counts, the no-counts notice suggests adding configs
-  for more Proton free servers;
-- **boot waits for the first config only** (2026-10-21). `main.py` awaits
+  for more Proton free servers. A sweep counts its blocks **per exit**
+  (2026-11-05): `_SweepThrottle.record(page_exit=…)` starts the breaker's
+  count over when the tunnel moves on, because one exit Instagram refuses
+  says nothing about the next — three blocks on RO-FREE#22 and two on
+  RO-FREE#30 had tripped it at five before NL-FREE#158, which answered all
+  17 accounts minutes later, was tried. Refused exits recover after a rest:
+  NL-FREE#158, refused at 11:12 UTC, served every page at 13:13;
+- **a restart starts on the exit that last worked** (2026-11-05). The first
+  page Instagram serves through each exit calls `report_answered`, and
+  `main.py` keeps that config's label in app_settings (`page_tunnel_exit`).
+  Boot reads it (the database now opens before the tunnel) and starts there
+  instead of on the first config in the file, which after that day's deploy
+  was an exit Instagram had stopped serving — it cost the first sweep;
+- **boot waits for one config only** (2026-10-21). `main.py` awaits
   `tunnel.start()` before the app serves, and `start()` used to try every
   config in turn. On Render each silent config cost ~20 s (the DNS lookup
   for the IP check timing out inside the tunnel), so five of them kept the
-  port closed for ~100 s. Now `start()` proves the first config, as before
-  and just as bounded, and if it gives no answer, the watchdog's first look
+  port closed for ~100 s. Now `start()` proves one config — the remembered
+  exit, else the first — as before and just as bounded, and if it gives no
+  answer, the watchdog's first look
   tries the rest at once (`_boot_lap`), not after the 5-minute re-check.
   With one config, nothing changes;
 - **each config that gives no answer says why.** Before, only the last

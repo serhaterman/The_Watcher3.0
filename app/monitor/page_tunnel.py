@@ -20,12 +20,13 @@ Configured with a standard WireGuard .conf (Proton VPN: account.protonvpn.com
 → Downloads → WireGuard configuration; the free plan has it), given as
 PAGE_TUNNEL_CONFIG (the text, or a path) or as a Render Secret File named
 page_tunnel.conf. Several configs may be given one after another (each from
-its own [Interface] line): the first that answers is used, and the next takes
-over when it stops — or when Instagram keeps refusing its IP. Started at boot
+its own [Interface] line): the first that answers is used — or, after a
+restart, the one Instagram last served pages through — and the next takes
+over when it stops, or when Instagram keeps refusing its IP. Started at boot
 and proved end to end — a request through it must come back — before anything
-is routed through it. Boot waits for the first config only; if it gives no
-answer the others are tried in the background at once, so silent configs do
-not hold the app's port closed. A tunnel that does not come up leaves the
+is routed through it. Boot waits for one config only; if it gives no answer
+the others are tried in the background at once, so silent configs do not hold
+the app's port closed. A tunnel that does not come up leaves the
 page door exactly as it was and says why — per config, including whether its
 server answered the WireGuard handshake.
 
@@ -61,10 +62,11 @@ import shutil
 import socket
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from app.config import settings
 from app.utils.logger import logger
+from app.utils.tasks import spawn
 
 # Where Render mounts a Secret File of this name.
 SECRET_FILE = Path("/etc/secrets/page_tunnel.conf")
@@ -185,6 +187,10 @@ class PageTunnel:
         # to one lap per ROTATE_WINDOW.
         self._refused: Optional[tuple[int, str]] = None
         self._left_at: dict[int, float] = {}
+        # The exit Instagram last served a page through, and where it is kept
+        # across restarts (see remember_exits and start's `prefer`).
+        self._answered_label: Optional[str] = None
+        self._remember: Optional[Callable[[str], Awaitable[None]]] = None
         # Set by start() when the first config gave no answer at boot: the
         # watchdog's first look runs the rest of the lap.
         self._boot_lap = False
@@ -265,9 +271,31 @@ class PageTunnel:
         self._wake.set()
         return True
 
+    def report_answered(self) -> None:
+        """Instagram served a page that came back through the tunnel, so this
+        exit works. The first answer on each exit is kept (remember_exits),
+        and a restart starts on it instead of on the first config in the file.
+        Measured 2026-11-05: a deploy came back up on RO-FREE#22, which
+        Instagram had stopped serving, and the first sweep failed on it and on
+        the next exit before the rotation reached NL-FREE#158 — which then
+        answered every account."""
+        if not self.up or self.label is None or self.label == self._answered_label:
+            return
+        self._answered_label = self.label
+        if self._remember is not None:
+            spawn(self._remember(self.label), name="page-tunnel:remember-exit")
+
+    def remember_exits(self, save: Callable[[str], Awaitable[None]]) -> None:
+        """Where report_answered keeps the exit that last worked, for
+        `start(prefer=...)` after a restart."""
+        self._remember = save
+
     # -------------------------------------------------------- lifecycle
 
-    async def start(self) -> None:
+    async def start(self, *, prefer: Optional[str] = None) -> None:
+        """Bring the tunnel up. `prefer` is the label of the exit Instagram
+        last served pages through (kept by remember_exits): boot starts on it
+        when it is still among the configs, else on the first."""
         text = _load_config()
         if text is None:
             return
@@ -299,19 +327,30 @@ class PageTunnel:
         self._port = _free_port()
         self._conf = self._dir / "wireproxy.conf"
         self._wake = asyncio.Event()
+        labels = [_label(c) for c in usable]
+        first = 0
+        if prefer is not None and prefer in labels:
+            first = labels.index(prefer)
+            self._answered_label = prefer
         if len(usable) > 1:
             logger.info(
-                "Page tunnel: {} configs ({}) — the first that answers is "
-                "used, the next takes over when it stops or Instagram keeps "
-                "refusing its IP",
-                len(usable), ", ".join(_label(c) for c in usable),
+                "Page tunnel: {} configs ({}) — {}, the next takes over when "
+                "it stops or Instagram keeps refusing its IP",
+                len(usable), ", ".join(labels),
+                f"starting on {prefer}, the one Instagram last served pages through"
+                if self._answered_label else "the first that answers is used",
             )
-        # Boot waits for the FIRST config only. The app does not serve until
-        # this returns, and a config that gives no answer costs ~20 s (on
-        # Render, 2026-10-21: the DNS lookup inside the tunnel timing out,
-        # config after config) — five silent ones held the port closed for
-        # ~100 s. The rest of the lap runs in the watchdog at once.
-        if await self._switch_to(0):
+            if prefer is not None and not self._answered_label:
+                logger.info(
+                    "Page tunnel: {}, the exit Instagram last served pages "
+                    "through, is not among its configs any more", prefer,
+                )
+        # Boot waits for ONE config only. The app does not serve until this
+        # returns, and a config that gives no answer costs ~20 s (on Render,
+        # 2026-10-21: the DNS lookup inside the tunnel timing out, config
+        # after config) — five silent ones held the port closed for ~100 s.
+        # The rest of the lap runs in the watchdog at once.
+        if await self._switch_to(first):
             pass
         elif len(usable) > 1:
             self._note_no_answer()

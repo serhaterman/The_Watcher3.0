@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import secrets
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -54,18 +54,37 @@ def ensure_webhook_secret() -> None:
     )
 
 
+# The page-tunnel exit Instagram last served pages through. A restart starts
+# on it, not on the first config in the file (PageTunnel.report_answered).
+TUNNEL_EXIT_SETTING = "page_tunnel_exit"
+
+
+async def remembered_tunnel_exit() -> Optional[str]:
+    async with get_session() as session:
+        return await crud.get_setting(session, TUNNEL_EXIT_SETTING) or None
+
+
+async def remember_tunnel_exit(label: str) -> None:
+    async with get_session() as session:
+        await crud.set_setting(session, TUNNEL_EXIT_SETTING, label)
+    logger.info("Page tunnel: Instagram serves pages through {} — a restart starts there", label)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     quiet_health_check_logs()
     logger.info("Starting The Watcher V3.0…")
-    # The page tunnel first: it decides where this host's profile-page
-    # requests leave from, and the route line below should say so.
-    await page_tunnel.tunnel.start()
+    await init_db()
+    # The page tunnel next: it decides where this host's profile-page
+    # requests leave from, and the route line below should say so. It starts
+    # on the exit Instagram last served pages through — measured 2026-11-05,
+    # starting on the first config after a deploy cost a whole sweep on an
+    # exit Instagram had stopped serving.
+    await page_tunnel.tunnel.start(prefer=await remembered_tunnel_exit())
+    page_tunnel.tunnel.remember_exits(remember_tunnel_exit)
     # Say the route once, at boot. A cloud host's own IP is 401-blocked, so a
     # misconfigured IG_PROXY_URL looks exactly like Instagram blocking us.
     logger.info("Instagram requests route via: {}", instagram_route())
-
-    await init_db()
 
     # One-time cleanup: the first public-page parser read the og: meta block,
     # whose counts were verified wrong against the real profile. The card reads

@@ -1296,6 +1296,8 @@ class InstagramClient:
             self._direct_page_failures = 0
             self._direct_page_blocked_until = 0.0
             self._direct_page_tunnel_answered = False
+            if outcome.get("route") == page_tunnel.TUNNEL_ROUTE:
+                page_tunnel.tunnel.report_answered()  # the exit a restart starts on
             return
         if outcome.get("status") == 404:
             return

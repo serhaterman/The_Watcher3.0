@@ -20,6 +20,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -289,6 +290,66 @@ async def test_queued_checks_skip_the_moment_it_opens() -> None:
            t.is_open() and woke < 1.0, f"woke after {woke:.2f}s")
 
 
+def test_each_page_exit_gets_its_own_count() -> None:
+    """Blocks are counted per page-tunnel exit: one Instagram refuses says
+    nothing about the next."""
+    t = _SweepThrottle(base_stagger=0.0, max_stagger=0.0, breaker_threshold=5)
+    for _ in range(3):
+        t.record(401, page_exit="RO-FREE#22 (185.252.220.117)")
+    for _ in range(2):
+        t.record(401, page_exit="RO-FREE#30 (146.70.246.171)")
+    expect("five blocks across two exits do not trip the breaker", not t.is_open())
+    t.record(401, page_exit=None)  # the tunnel between exits: the page left from this host
+    expect("a check while the tunnel moves does not start the count over",
+           t._consecutive_auth_fails == 3, repr(t._consecutive_auth_fails))
+    for _ in range(2):
+        t.record(401, page_exit="RO-FREE#30 (146.70.246.171)")
+    expect("five blocks on one exit still do", t.is_open())
+
+
+async def test_a_sweep_reaches_the_exit_that_answers() -> None:
+    """The 2026-11-05 13:08 UTC sweep, replayed: three blocks on RO-FREE#22
+    moved the tunnel to RO-FREE#30, two more there tripped the breaker at
+    five, and the 12 accounts left were deferred — while NL-FREE#158 answered
+    all 17 five minutes later. Each exit now gets its own count."""
+    service = MonitorService(
+        instagram=AsyncMock(), hasher=AsyncMock(), notifier=AsyncMock(), stories=None,
+    )
+    exits = [("RO-FREE#22", "185.252.220.117"), ("RO-FREE#30", "146.70.246.171"),
+             ("NL-FREE#158", "185.107.56.154")]
+    tunnel = SimpleNamespace(up=True, label=exits[0][0], egress_ip=exits[0][1])
+    refused_here = 0
+    calls: list[tuple[str, str]] = []
+
+    async def fake_run_check(account_id, username, **kw):
+        nonlocal refused_here
+        calls.append((username, tunnel.label))
+        if tunnel.label == "NL-FREE#158":
+            return {"ok": True, "username": username, "status": 200}
+        refused_here += 1
+        if refused_here == 3:  # the page door's breaker trips: the tunnel moves on
+            index = [label for label, _ in exits].index(tunnel.label)
+            tunnel.label, tunnel.egress_ip = exits[index + 1]
+            refused_here = 0
+        return {"ok": False, "username": username, "status": 401, "id_status": 401,
+                "error": "login page"}
+
+    service._run_check = fake_run_check  # type: ignore[assignment]
+    old_tunnel = page_tunnel.tunnel
+    page_tunnel.tunnel = tunnel
+    try:
+        t = _SweepThrottle(base_stagger=0.0, max_stagger=0.0, breaker_threshold=5)
+        results = [await service._staggered_check(t, i, f"user{i}") for i in range(17)]
+    finally:
+        page_tunnel.tunnel = old_tunnel
+    expect("the sweep reaches the third exit instead of stopping at five blocks",
+           not t.is_open() and len(calls) == 17 and calls[-1][1] == "NL-FREE#158",
+           repr(calls[-3:]))
+    expect("every account after it answers, none is deferred",
+           sum(1 for r in results if r.get("status") == 200) == 11 and t.skipped == 0,
+           repr([r.get("status") for r in results]))
+
+
 def test_gate_down_stops_instead_of_pausing() -> None:
     """A sweep where NOTHING answers is not a throttle to pace around — it is
     the gate shut. One worker call is 8 upstream attempts, so walking the rest
@@ -470,6 +531,8 @@ async def main() -> int:
     await test_retry_budget_stops_a_long_outage()
     await test_staggered_check_defers_after_open()
     await test_queued_checks_skip_the_moment_it_opens()
+    test_each_page_exit_gets_its_own_count()
+    await test_a_sweep_reaches_the_exit_that_answers()
 
     await dispose_engine()
     print()

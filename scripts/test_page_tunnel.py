@@ -53,9 +53,16 @@ if str(ROOT) not in sys.path:
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "x")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "1")
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+# A file, not :memory: — the exit a restart starts on is kept in the settings
+# table, and every aiosqlite connection to :memory: is its own empty database.
+DB_FILE = ROOT / "test_page_tunnel.db"
+if DB_FILE.exists():
+    DB_FILE.unlink()
+os.environ.setdefault("DATABASE_URL", f"sqlite+aiosqlite:///{DB_FILE.as_posix()}")
 
 from app.config import settings  # noqa: E402
+from app.database.models import Base  # noqa: E402
+from app.database.session import dispose_engine, engine  # noqa: E402
 from app.monitor import page_tunnel  # noqa: E402
 from app.monitor.instagram import InstagramClient  # noqa: E402
 from app.monitor.page_tunnel import PageTunnel  # noqa: E402
@@ -753,6 +760,93 @@ async def test_a_refused_ip_moves_to_the_next_config(fx: _Fixture) -> None:
             setattr(settings if n == "page_tunnel_config" else page_tunnel, n, value)
 
 
+async def test_a_restart_starts_on_the_exit_that_last_worked(fx: _Fixture) -> None:
+    """Measured 2026-11-05: a deploy came back up on the first config in the
+    file, RO-FREE#22, which Instagram had stopped serving; the first sweep
+    failed there and on the next exit before the rotation reached the one
+    that answered every account. Boot now starts on the exit Instagram last
+    served pages through, and the first answer on each exit is kept."""
+    names = ("page_tunnel_config", "CHECK_URL", "CHECK_URL_SECOND", "tunnel", "WATCH_INTERVAL")
+    old = {n: getattr(settings if n == "page_tunnel_config" else page_tunnel, n) for n in names}
+    settings.page_tunnel_config = str(fx.two_confs)
+    page_tunnel.CHECK_URL = page_tunnel.CHECK_URL_SECOND = fx.check_url
+    page_tunnel.WATCH_INTERVAL = 0.05
+    fx.dead.write_text("", encoding="utf-8")
+    kept: list[str] = []
+
+    async def keep(label: str) -> None:
+        kept.append(label)
+
+    lines: list[str] = []
+    sink = logger.add(lambda m: lines.append(m.record["message"]), level="INFO")
+    try:
+        tunnel = fx.tunnel("ok")
+        page_tunnel.tunnel = tunnel
+        await tunnel.start(prefer="TEST-FREE#2")
+        tunnel.remember_exits(keep)
+        expect("a restart starts on the exit Instagram last served pages through",
+               tunnel.up and tunnel.label == "TEST-FREE#2", tunnel.describe())
+        expect("and says so", any("starting on TEST-FREE#2" in line for line in lines), repr(lines))
+        tunnel.report_answered()
+        await asyncio.sleep(0.05)
+        expect("an answer on the exit it started on is nothing new to keep", kept == [], repr(kept))
+        await tunnel.stop()
+
+        lines.clear()
+        tunnel = fx.tunnel("ok")
+        page_tunnel.tunnel = tunnel
+        await tunnel.start(prefer="GONE-FREE#9")
+        tunnel.remember_exits(keep)
+        expect("an exit no longer in the file starts on the first",
+               tunnel.up and tunnel.label == "TEST-FREE#1", tunnel.describe())
+        expect("saying the old one is gone",
+               any("GONE-FREE#9" in line and "not among its configs" in line for line in lines),
+               repr(lines))
+        tunnel.report_answered()
+        tunnel.report_answered()
+        await asyncio.sleep(0.05)
+        expect("the first answer on an exit is kept, once", kept == ["TEST-FREE#1"], repr(kept))
+        tunnel.up = False
+        tunnel._answered_label = None
+        tunnel.report_answered()
+        await asyncio.sleep(0.05)
+        expect("a tunnel that is down keeps nothing", kept == ["TEST-FREE#1"], repr(kept))
+        tunnel.up = True
+        await tunnel.stop()
+    finally:
+        logger.remove(sink)
+        for n, value in old.items():
+            setattr(settings if n == "page_tunnel_config" else page_tunnel, n, value)
+
+
+async def test_the_door_reports_the_exit_that_served_a_page() -> None:
+    old_tunnel = page_tunnel.tunnel
+    try:
+        tunnel = PageTunnel()
+        answered: list[bool] = []
+        tunnel.report_answered = lambda: answered.append(True)  # type: ignore[method-assign]
+        page_tunnel.tunnel = tunnel
+        async with InstagramClient(max_retries=1, session=_Scripted()) as client:
+            client._note_direct_page({"parsed": {"username": "x"}, "route": page_tunnel.TUNNEL_ROUTE})
+            expect("a page served through the tunnel is reported", answered == [True], repr(answered))
+            client._note_direct_page({"parsed": {"username": "x"}, "route": "this host"})
+            client._note_direct_page({"parsed": None, "status": 429, "route": page_tunnel.TUNNEL_ROUTE})
+            expect("one served from this host, or a refusal, is not", answered == [True], repr(answered))
+    finally:
+        page_tunnel.tunnel = old_tunnel
+
+
+async def test_the_exit_is_kept_across_restarts() -> None:
+    from app.main import remember_tunnel_exit, remembered_tunnel_exit
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    expect("nothing is kept before an exit has served a page", await remembered_tunnel_exit() is None)
+    await remember_tunnel_exit("NL-FREE#158")
+    expect("the exit that served pages is what a restart reads",
+           await remembered_tunnel_exit() == "NL-FREE#158")
+
+
 async def test_one_config_is_never_moved(fx: _Fixture) -> None:
     """With one config there is nowhere to go: a refused IP leaves the tunnel
     alone and the page door's cooldown is what holds, exactly as before."""
@@ -905,11 +999,15 @@ async def main() -> int:
         await test_only_an_unanswered_page_request_suspects_the_tunnel()
         await test_the_door_asks_for_a_move_only_when_instagram_answers()
         await test_a_refused_ip_moves_to_the_next_config(fx)
+        await test_a_restart_starts_on_the_exit_that_last_worked(fx)
+        await test_the_door_reports_the_exit_that_served_a_page()
+        await test_the_exit_is_kept_across_restarts()
         await test_one_config_is_never_moved(fx)
         await test_boot_waits_for_the_first_config_only(fx)
         await test_each_silent_config_says_why(fx)
     finally:
         fx.close()
+        await dispose_engine()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {', '.join(FAILURES)}")
