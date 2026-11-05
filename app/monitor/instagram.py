@@ -121,7 +121,9 @@ class IdProbe:
     # {"has_public_story", "is_live", "highlights"} — the shape the story
     # phase consumes, so one probe serves the whole check.
     reel_data: Optional[dict[str, Any]] = None
-    # Which route answered: "cache", "worker", "direct", "home" (the phone).
+    # Which route answered: "cache", "worker", "direct", "home" (the phone);
+    # "worker-shut" when a sweep did not ask the Worker because it has been
+    # refusing (the status is then the refusal it last gave).
     via: str = ""
 
     @property
@@ -331,9 +333,11 @@ class InstagramClient:
         self._direct_page_tunnel_answered = False
         # The Worker's reel route. Refused per colo, and each refusal is ~9 s
         # of upstream retries; after a few in a row the phone is asked first
-        # for a while, the Worker only when the phone has no answer.
+        # for a while, the Worker only when the phone has no answer — and a
+        # sweep with no phone skips it (see probe_by_id).
         self._worker_reel_failures = 0
         self._worker_reel_blocked_until = 0.0
+        self._worker_reel_last_status = 0
         if session is not None:
             self._session: _SessionLike = session
             self._own_session = False
@@ -495,7 +499,12 @@ class InstagramClient:
         return parsed
 
     async def probe_by_id(
-        self, user_id: str, *, cached_ok: bool = False, ask_phone: bool = True
+        self,
+        user_id: str,
+        *,
+        cached_ok: bool = False,
+        ask_phone: bool = True,
+        knock_refusing: bool = True,
     ) -> IdProbe:
         """Ask Instagram about a NUMERIC id and report exactly what it said.
 
@@ -514,6 +523,14 @@ class InstagramClient:
         `ask_phone=False` keeps the phone out of the live routes: a sweep
         that has to ask after all (its page failed) must not then sit on a
         live phone request — the phone already had its chance at the page.
+
+        `knock_refusing=False` (sweeps) skips the Worker while it is known to
+        be refusing and no phone is asked instead: the route's last refusal
+        stands as the answer, as the username API's does. Measured 2026-11-05
+        with the route refusing every id since 11-04 and no phone: 8.5-9 s of
+        upstream retries on every failing account of every sweep. One knock
+        per cooldown still notices the route opening again; a manual check
+        (someone is waiting, and this is the only rename route) always knocks.
         """
         probe = IdProbe(user_id=str(user_id or ""))
         if not probe.user_id:
@@ -543,6 +560,10 @@ class InstagramClient:
 
         phone = phone and ask_phone
         worker_refusing = time.monotonic() < self._worker_reel_blocked_until
+        if worker_refusing and not phone and not knock_refusing:
+            probe.status = self._worker_reel_last_status
+            probe.via = "worker-shut"
+            return probe
         order = ["home", "worker"] if (phone and worker_refusing) else ["worker", "home"]
         status, parsed = 0, None
         for route in order:
@@ -569,14 +590,16 @@ class InstagramClient:
             self._worker_reel_blocked_until = 0.0
             return
         self._worker_reel_failures += 1
+        self._worker_reel_last_status = status
         if (
             self._worker_reel_failures >= self._WORKER_REEL_BREAKER_FAILURES
             and time.monotonic() >= self._worker_reel_blocked_until
         ):
             self._worker_reel_blocked_until = time.monotonic() + self._WORKER_REEL_COOLDOWN
             logger.info(
-                "The Worker's reel route was refused {} times in a row — asking "
-                "the home fetcher first for the next {:.0f} min",
+                "The Worker's reel route was refused {} times in a row — for the "
+                "next {:.0f} min the home fetcher is asked first, and a sweep "
+                "without one skips the route",
                 self._worker_reel_failures, self._WORKER_REEL_COOLDOWN / 60,
             )
 

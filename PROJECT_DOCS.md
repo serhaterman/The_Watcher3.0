@@ -587,6 +587,13 @@ Set `IG_PROXY_URL` in environment variables to enable. The bot falls back to
 direct Instagram requests if the proxy is unreachable, and serves repeated
 reel queries from a 90-second in-memory cache to keep request volume low.
 
+Since 2026-11-04 the `?user_id=` route answers 401 for every id. After three
+refusals in a row it is skipped for 10 minutes: the home fetcher is asked
+first when one is connected, and a sweep without one does not ask the Worker
+at all (`probe_by_id(knock_refusing=False)` — the last refusal stands as the
+answer), so each window costs a sweep one knock instead of ~9 s on every
+failing account. A manual check always knocks.
+
 **Cloudflare edge IPs are not immune — they are just better odds.** Worth
 stating plainly, because the opposite assumption shaped earlier versions of
 this design:

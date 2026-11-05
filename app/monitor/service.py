@@ -2095,7 +2095,7 @@ class MonitorService:
         if instagram_id:
             clock = time.monotonic()
             probe = await self.instagram.probe_by_id(
-                instagram_id, cached_ok=not thorough
+                instagram_id, cached_ok=not thorough, knock_refusing=thorough
             )
             timings[f"id/{probe.via}" if probe.via else "id"] = time.monotonic() - clock
             if probe.gone:
@@ -2154,7 +2154,7 @@ class MonitorService:
             # failed.
             clock = time.monotonic()
             probe = await self.instagram.probe_by_id(
-                instagram_id, ask_phone=False
+                instagram_id, ask_phone=False, knock_refusing=thorough
             )
             timings[f"id/{probe.via or 'live'}"] = time.monotonic() - clock
             if probe.gone:
