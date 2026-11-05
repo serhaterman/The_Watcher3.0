@@ -169,7 +169,7 @@ the_watcher_V3.0/
 │   └── utils/
 │       ├── formatting.py    # fmt_timestamp (Damascus UTC+3), fmt_number, esc, truncate
 │       ├── logger.py        # Loguru logger
-│       └── user_agents.py   # UA pool for the Cloudflare Worker
+│       └── tasks.py         # spawn(): background work that is held and reports itself
 ├── scripts/
 │   ├── test_stories.py      # End-to-end stories smoke test
 │   ├── test_ig_fetch.py     # Instagram fetch smoke test

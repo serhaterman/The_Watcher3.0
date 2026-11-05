@@ -195,12 +195,6 @@ class HomeFetchBroker:
         return self._worker
 
     @property
-    def worker_kinds(self) -> frozenset[str]:
-        """What the connected worker knows how to fetch. An older worker
-        build fetches pages only; it is never handed a reel job."""
-        return self._worker_kinds
-
-    @property
     def pending(self) -> int:
         """Jobs queued or in the phone's hands, not yet answered."""
         return len(self._jobs)

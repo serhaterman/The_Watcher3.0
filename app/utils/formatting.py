@@ -32,12 +32,6 @@ def fmt_delta(old: Optional[int], new: Optional[int]) -> str:
     return f" ({sign}{diff:,})"
 
 
-def fmt_bool(b: Optional[bool]) -> str:
-    if b is None:
-        return "—"
-    return "YES" if b else "NO"
-
-
 def fmt_timestamp(dt: Optional[datetime]) -> str:
     if dt is None:
         return "—"

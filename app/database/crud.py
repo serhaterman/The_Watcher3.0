@@ -83,16 +83,6 @@ async def remove_account(session: AsyncSession, username: str) -> bool:
     return result.rowcount > 0
 
 
-async def deactivate_account(session: AsyncSession, username: str) -> bool:
-    username = normalize_username(username)
-    result = await session.execute(
-        update(MonitoredAccount)
-        .where(MonitoredAccount.username == username)
-        .values(active=False)
-    )
-    return result.rowcount > 0
-
-
 async def set_account_active(
     session: AsyncSession, username: str, active: bool
 ) -> bool:

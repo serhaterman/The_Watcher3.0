@@ -455,7 +455,7 @@ app/
 ├── database/       SQLAlchemy models, async session, CRUD helpers
 ├── monitor/        Instagram client, public-page fallback parser, anonymous media
 │                   downloader, change detector, perceptual hashing, sweep orchestrator
-├── utils/          Logging setup, user-agent rotation, formatting helpers
+├── utils/          Logging setup, formatting helpers, background tasks
 ├── workers/        APScheduler-based sweep worker
 ├── config.py       Pydantic Settings — environment-driven configuration
 └── main.py         FastAPI app, lifespan wiring, service initialization
