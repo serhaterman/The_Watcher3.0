@@ -56,7 +56,7 @@ os.environ.setdefault("TELEGRAM_CHAT_ID", "1")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 from app.config import settings  # noqa: E402
-from app.monitor import home_fetch, page_tunnel  # noqa: E402
+from app.monitor import page_tunnel  # noqa: E402
 from app.monitor.instagram import InstagramClient  # noqa: E402
 from app.monitor.page_tunnel import PageTunnel  # noqa: E402
 from app.utils.logger import logger  # noqa: E402

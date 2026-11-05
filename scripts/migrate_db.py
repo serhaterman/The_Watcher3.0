@@ -36,11 +36,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from sqlalchemy import BigInteger, DateTime, Integer, Table, func, select, text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy import BigInteger, DateTime, Integer, Table, func, select, text  # noqa: E402
+from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
 
-from app.db_url import normalize_db_url
-from app.database.models import Base
+from app.db_url import normalize_db_url  # noqa: E402
+from app.database.models import Base  # noqa: E402
 
 
 def _datetime_columns(table: Table) -> set[str]:

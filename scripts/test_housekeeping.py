@@ -21,7 +21,6 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 from unittest.mock import AsyncMock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,7 +38,6 @@ from app.config import settings  # noqa: E402
 from app.database import crud  # noqa: E402
 from app.database.models import Base, MonitoredAccount  # noqa: E402
 from app.database.session import engine, get_session  # noqa: E402
-from app.monitor import home_fetch  # noqa: E402
 from app.monitor.home_fetch import HomeFetchBroker, PageResult  # noqa: E402
 from app.monitor.instagram import IdProbe, ProfileFetchResult  # noqa: E402
 from app.monitor.service import MonitorService  # noqa: E402

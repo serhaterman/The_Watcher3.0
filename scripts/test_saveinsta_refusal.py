@@ -20,7 +20,6 @@ import os
 import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 ROOT = Path(__file__).resolve().parents[1]

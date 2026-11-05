@@ -15,7 +15,7 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "x")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "x")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./test.db")
 
-from app.bot.handlers import _format_interval, _parse_interval
+from app.bot.handlers import _format_interval, _parse_interval  # noqa: E402
 
 CASES = [
     ("30m", 1800),

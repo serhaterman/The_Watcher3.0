@@ -18,9 +18,9 @@ if db_file.exists():
     db_file.unlink()
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{db_file.as_posix()}"
 
-from app.database.models import AppSetting
-from app.database.session import dispose_engine, engine
-from app.workers.scheduler import (
+from app.database.models import AppSetting  # noqa: E402
+from app.database.session import dispose_engine, engine  # noqa: E402
+from app.workers.scheduler import (  # noqa: E402
     WatcherScheduler,
     load_persisted_interval,
     persist_interval,

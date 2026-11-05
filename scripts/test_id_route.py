@@ -746,7 +746,7 @@ async def test_the_page_answers_the_story_question_when_the_reel_route_is_refuse
 async def test_a_manual_check_skips_a_door_known_to_be_shut() -> None:
     """Someone is waiting on a Recheck: no ten-second knocks on a door the
     last sweep found shut. The id route and the pages still run."""
-    account_id = await _new_account("manual_skip")
+    await _new_account("manual_skip")
     await _set_door(True)
     ig = ScriptedInstagram()
     ig.probe = lambda i: _answered(i, "manual_skip")
