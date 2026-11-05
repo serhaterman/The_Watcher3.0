@@ -13,10 +13,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# curl for the HEALTHCHECK, CA certificates for TLS. No compiler and no libpq:
+# they were there to build psycopg2, which nothing used and which is gone
+# (2026-11-05); every remaining requirement installs from a Python 3.12 wheel.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        build-essential \
-        libpq-dev \
         curl \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
