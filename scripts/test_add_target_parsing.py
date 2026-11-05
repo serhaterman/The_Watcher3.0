@@ -88,8 +88,17 @@ def test_empty() -> None:
     expect("whitespace", _parse_add_target("   ") == (None, None))
 
 
+def test_ids_typed_in_other_scripts() -> None:
+    """An Arabic keyboard types ١٢٣ for 123. "\d" matches it, and the id went
+    on to Instagram as typed; it is the ASCII number Instagram knows."""
+    expect("an Arabic-Indic id is read as its ASCII number",
+           _parse_add_target("١٢٣٤٥") == (None, "12345"))
+    expect("dots alone are no username", _parse_add_target("..") == (None, None))
+
+
 def main() -> int:
     test_valid_inputs()
+    test_ids_typed_in_other_scripts()
     test_lookalike_hosts_rejected()
     test_other_urls_rejected()
     test_empty()

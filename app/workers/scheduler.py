@@ -90,7 +90,7 @@ async def load_persisted_interval() -> int:
     """Return the interval in seconds — DB value if set, otherwise env default."""
     async with get_session() as session:
         raw = await crud.get_setting(session, SETTING_INTERVAL)
-    if raw and raw.isdigit():
+    if raw and raw.isdecimal():
         value = int(raw)
         if MIN_INTERVAL <= value <= MAX_INTERVAL:
             return value

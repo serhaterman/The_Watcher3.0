@@ -195,7 +195,7 @@ def _highlight_catalog(user: dict[str, Any]) -> Optional[dict[str, str]]:
     for edge in edges:
         node = edge.get("node") if isinstance(edge, dict) else None
         highlight_id = node.get("id") if isinstance(node, dict) else None
-        if not isinstance(highlight_id, (str, int)) or not str(highlight_id).isdigit():
+        if not isinstance(highlight_id, (str, int)) or not _ascii_digits(highlight_id):
             return None  # a list with an unreadable entry is not a complete one
         catalog[str(highlight_id)] = _text(node.get("title")) or ""
     return catalog
@@ -225,6 +225,13 @@ def _grid_empty(blocks: list[dict[str, Any]], pk: Optional[str]) -> Optional[boo
             return False
         return True if page_info.get("has_next_page") is False else None
     return None
+
+
+def _ascii_digits(value: Any) -> bool:
+    """An id Instagram sends is plain ASCII digits; `str.isdigit` would also
+    pass superscripts and other scripts' digits."""
+    text = str(value)
+    return text.isascii() and text.isdigit()
 
 
 def _text(value: Any) -> Optional[str]:
@@ -296,7 +303,7 @@ def parse_public_profile(page: str, username: str) -> Optional[dict[str, Any]]:
     # `pk` is the numeric id the rest of the bot keys on (the sibling `id` is a
     # different, app-scoped identifier — storing it would break the reel query).
     pk = user.get("pk")
-    if isinstance(pk, (str, int)) and str(pk).isdigit():
+    if isinstance(pk, (str, int)) and _ascii_digits(pk):
         parsed["instagram_id"] = str(pk)
 
     # Story status. `latest_reel_media` is the newest active story's timestamp

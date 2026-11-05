@@ -874,7 +874,7 @@ async def get_account_topic(
 ) -> Optional[int]:
     """Return the Telegram forum topic (message_thread_id) for an account."""
     raw = await get_setting(session, _topic_key(account_id))
-    if raw and raw.lstrip("-").isdigit():
+    if raw and raw.lstrip("-").isdecimal():
         return int(raw)
     return None
 

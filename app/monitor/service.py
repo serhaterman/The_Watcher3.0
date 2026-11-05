@@ -4070,7 +4070,7 @@ class MonitorService:
         key = self._public_grab_key(account_id)
         async with get_session() as session:
             raw = await crud.get_setting(session, key)
-        attempts = int(raw) if raw and raw.isdigit() else 0
+        attempts = int(raw) if raw and raw.isdecimal() else 0
         if went_public and attempts == 0:
             attempts = 1
         if attempts == 0:

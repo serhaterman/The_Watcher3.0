@@ -302,7 +302,7 @@ def _parse_add_target(raw: str) -> tuple[Optional[str], Optional[str]]:
     if match:
         path = match.group(1)
         if _INSTAGRAM_ID_RE.match(path):
-            return None, path
+            return None, str(int(path))
         return _normalize_username(path), None
 
     # Anything else that carries URL structure (a scheme or a path separator) is
@@ -315,7 +315,9 @@ def _parse_add_target(raw: str) -> tuple[Optional[str], Optional[str]]:
     if not candidate:
         return None, None
     if _INSTAGRAM_ID_RE.match(candidate):
-        return None, candidate
+        # str(int(...)): "\d" matches any script's digits, and Arabic
+        # keyboards type ١٢٣ — the id Instagram knows is ASCII.
+        return None, str(int(candidate))
     return _normalize_username(candidate), None
 
 
@@ -324,7 +326,7 @@ def _parse_interval(raw: str) -> Optional[int]:
     text = raw.strip().lower()
     if not text:
         return None
-    if text.isdigit():
+    if text.isdecimal():
         n = int(text)
         return n or None
     m = _INTERVAL_RE.match(text)
@@ -1676,7 +1678,7 @@ async def _download_highlight(
 ) -> None:
     """Download one highlight (by its list index) and send its items."""
     query = update.callback_query
-    if not index_raw.lstrip("-").isdigit():
+    if not index_raw.lstrip("-").isdecimal():
         await _safe_answer(query, "Invalid highlight.")
         return
     await _safe_answer(query, "Downloading…")
@@ -1706,7 +1708,7 @@ async def _toggle_highlight_tracking(
 ) -> None:
     """Mute/unmute the sweep auto-download for one highlight, then re-render."""
     query = update.callback_query
-    if not index_raw.lstrip("-").isdigit():
+    if not index_raw.lstrip("-").isdecimal():
         await _safe_answer(query, "Invalid highlight.")
         return
     service: MonitorService = context.application.bot_data["monitor"]
@@ -1954,7 +1956,7 @@ async def _run_bundle_download(
     instagram_id = state.get("instagram_id") if state_ok else None
 
     hl_indexes = sorted(
-        int(t[1:]) for t in tokens if t.startswith("h") and t[1:].isdigit()
+        int(t[1:]) for t in tokens if t.startswith("h") and t[1:].isdecimal()
     )
     want_story = everything or "story" in tokens
     want_pic = everything or "pic" in tokens
@@ -2151,7 +2153,7 @@ async def _handle_download(
         await _safe_answer(query)
         page = (
             int(parts[1])
-            if len(parts) > 1 and parts[1].lstrip("-").isdigit()
+            if len(parts) > 1 and parts[1].lstrip("-").isdecimal()
             else 0
         )
         async with get_session() as session:
@@ -2203,7 +2205,7 @@ async def _handle_download(
         items = state.get("items", [])
         valid = token in _DL_FIXED_TOKENS or (
             token.startswith("h")
-            and token[1:].isdigit()
+            and token[1:].isdecimal()
             and int(token[1:]) < len(items)
         )
         if not valid:
@@ -3359,7 +3361,7 @@ async def _handle_menu(
         await _safe_answer(query)
         page = (
             int(parts[1])
-            if len(parts) > 1 and parts[1].lstrip("-").isdigit()
+            if len(parts) > 1 and parts[1].lstrip("-").isdecimal()
             else 0
         )
         async with get_session() as session:
@@ -3462,7 +3464,7 @@ async def _handle_menu(
                 reply_markup=keyboards.cancel_only(),
             )
             return
-        if not choice.isdigit():
+        if not choice.isdecimal():
             await _safe_answer(query, "Invalid preset.")
             return
         seconds = int(choice)

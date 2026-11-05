@@ -662,7 +662,7 @@ def _split_text(text: str, *, limit: int) -> list[str]:
 
 def build_dispatcher(bot: Bot) -> NotificationDispatcher:
     chat_id: Union[int, str] = settings.telegram_chat_id
-    if isinstance(chat_id, str) and chat_id.lstrip("-").isdigit():
+    if isinstance(chat_id, str) and chat_id.lstrip("-").isdecimal():
         chat_id = int(chat_id)
     mirrors = [m for m in settings.mirror_chat_ids if m != chat_id]
     if mirrors:

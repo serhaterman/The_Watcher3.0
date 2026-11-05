@@ -313,7 +313,7 @@ class Settings(BaseSettings):
         out: List[int] = []
         for chunk in self.home_fetch_battery_alerts.split(","):
             chunk = chunk.strip()
-            if not chunk.isdigit():
+            if not chunk.isdecimal():
                 continue
             level = max(1, min(100, int(chunk)))
             if level not in out:
@@ -327,7 +327,7 @@ class Settings(BaseSettings):
         out: List[int] = []
         for chunk in self.telegram_admin_ids.split(","):
             chunk = chunk.strip()
-            if chunk.isdigit() or (chunk.startswith("-") and chunk[1:].isdigit()):
+            if chunk.isdecimal() or (chunk.startswith("-") and chunk[1:].isdecimal()):
                 out.append(int(chunk))
         return out
 
@@ -340,7 +340,7 @@ class Settings(BaseSettings):
             chunk = chunk.strip()
             if not chunk:
                 continue
-            if chunk.lstrip("-").isdigit():
+            if chunk.lstrip("-").isdecimal():
                 out.append(int(chunk))
             else:
                 out.append(chunk)
