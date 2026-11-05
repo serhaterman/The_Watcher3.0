@@ -296,9 +296,16 @@ class _SweepThrottle:
         self._lock = asyncio.Lock()
         self._next_slot = 0.0  # monotonic time the next check may proceed
         self._pause_until = 0.0  # monotonic time the guard's cooldown ends
+        # Set when the breaker opens, so a check waiting out its gap wakes
+        # to be skipped instead of sleeping for a request it won't make.
+        self._opened = asyncio.Event()
 
     def is_open(self) -> bool:
         return self._open
+
+    def _trip(self) -> None:
+        self._open = True
+        self._opened.set()
 
     @property
     def tripped(self) -> bool:
@@ -451,7 +458,7 @@ class _SweepThrottle:
                     # out of — stop now rather than spend the rest of the
                     # sweep proving it.
                     self._gate_down = True
-                    self._open = True
+                    self._trip()
                     logger.warning(
                         "Instagram's gate is blocking every request ({} in a "
                         "row, 0 answered) — stopping the sweep instead of "
@@ -469,7 +476,7 @@ class _SweepThrottle:
                         self._cooldown, streak, self._pauses, self._max_pauses,
                     )
                 else:
-                    self._open = True
+                    self._trip()
         # A 404/429/0 on the username route with nothing else asked leaves
         # pacing unchanged — that isn't the datacenter block.
 
@@ -496,8 +503,13 @@ class _SweepThrottle:
                 depart = max(now, self._next_slot, self._pause_until)
                 self._next_slot = depart + self.current_stagger
             wait = depart - now
-            if wait > 0:
-                await asyncio.sleep(wait)
+            if wait > 0 and not self._open:
+                # Cut short when the breaker opens meanwhile: the caller then
+                # skips at once. Measured 2026-11-05: the 12 checks queued
+                # behind a stopped sweep sat out ~150 s of gaps one by one,
+                # each holding the lane, just to be skipped.
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._opened.wait(), wait)
             try:
                 yield
             finally:

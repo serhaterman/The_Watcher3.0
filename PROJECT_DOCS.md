@@ -397,7 +397,10 @@ sweep itself is paced by `_SweepThrottle`:
   and carry on (those accounts stay in this sweep). If **nothing** has
   answered, the gate is shut: stop immediately, skip the retry rounds, and
   skip the per-account reel fallback, because no pace helps and every further
-  request is blocked traffic that keeps it shut.
+  request is blocked traffic that keeps it shut. "Immediately" includes the
+  checks already queued: opening the breaker wakes the one waiting out its
+  gap, and the rest skip without a wait (until 2026-11-05 the 12 accounts
+  behind a stopped sweep sat out ~150 s of gaps just to be skipped).
 - **Nothing outruns the pacer.** `_SweepThrottle` only knows about its own
   sweep, so a stakeout ticking every two minutes, a card Recheck or `/story`
   fired unpaced requests into the middle of a paced sweep and the burst guard

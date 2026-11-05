@@ -242,6 +242,53 @@ async def test_staggered_check_defers_after_open() -> None:
     expect("throttle counted the skips", t.skipped == 3, repr(t.skipped))
 
 
+async def test_queued_checks_skip_the_moment_it_opens() -> None:
+    """Measured 2026-11-05: the breaker opened on the 5th of 17 accounts, and
+    the 12 checks queued behind it each sat out its pacing gap (widened by the
+    blocks) before being skipped — 150 s between "stopping the sweep" and the
+    deferral. A check now skips as soon as the breaker is open."""
+    service = MonitorService(
+        instagram=AsyncMock(), hasher=AsyncMock(),
+        notifier=AsyncMock(), stories=None,
+    )
+    calls: list[str] = []
+    tripped_at: list[float] = []
+
+    async def fake_run_check(account_id, username, **kw):
+        calls.append(username)
+        if len(calls) == 3:
+            tripped_at.append(time.monotonic())  # its 401 opens the breaker
+        return {"ok": False, "username": username, "status": 401, "error": "blocked"}
+
+    service._run_check = fake_run_check  # type: ignore[assignment]
+    t = _SweepThrottle(base_stagger=0.1, max_stagger=0.5, breaker_threshold=3)
+    results = await asyncio.gather(
+        *(service._staggered_check(t, i, f"user{i}") for i in range(10))
+    )
+    after = time.monotonic() - tripped_at[0]
+    expect("only the three blocks that opened it were fetched", len(calls) == 3, repr(calls))
+    expect("the seven queued checks are deferred",
+           sum(1 for r in results if r.get("skipped")) == 7 and t.skipped == 7, repr(t.skipped))
+    # Unfixed, each waited its 0.4-0.5 s gap plus up to 0.8 s of noise: >= 3.4 s.
+    expect("without sitting out their gaps", after < 0.5, f"{after:.2f}s after the breaker opened")
+
+    t = _SweepThrottle(base_stagger=5.0, max_stagger=5.0, breaker_threshold=1)
+    async with t.slot():
+        pass  # the next check may not leave for 5 s or more
+
+    async def block_soon() -> None:
+        await asyncio.sleep(0.1)
+        t.record(401)  # nothing has answered: the breaker opens at once
+
+    start = time.monotonic()
+    blocker = asyncio.ensure_future(block_soon())
+    async with t.slot():
+        woke = time.monotonic() - start
+    await blocker
+    expect("a check already waiting out its gap wakes when it opens",
+           t.is_open() and woke < 1.0, f"woke after {woke:.2f}s")
+
+
 def test_gate_down_stops_instead_of_pausing() -> None:
     """A sweep where NOTHING answers is not a throttle to pace around — it is
     the gate shut. One worker call is 8 upstream attempts, so walking the rest
@@ -422,6 +469,7 @@ async def main() -> int:
     await test_id_only_retries_stop_when_a_round_recovers_nothing()
     await test_retry_budget_stops_a_long_outage()
     await test_staggered_check_defers_after_open()
+    await test_queued_checks_skip_the_moment_it_opens()
 
     await dispose_engine()
     print()
