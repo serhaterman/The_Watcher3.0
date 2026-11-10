@@ -58,6 +58,10 @@ RESULT_TTL_SECONDS = 900.0
 # A queued job nobody picked up in this long is stale — the sweep that
 # wanted it is long over.
 JOB_MAX_AGE_SECONDS = 600.0
+# A job the worker took and has not answered in this long was abandoned: its
+# fetch or its upload failed, or the phone lost the network mid-batch. The
+# slowest delivery measured took ~32 s (a phone upload over Proton VPN).
+HANDED_MAX_AGE_SECONDS = 120.0
 
 KIND_PAGE = "page"
 KIND_REEL = "reel"
@@ -189,12 +193,6 @@ class HomeFetchBroker:
     @property
     def worker(self) -> Optional[str]:
         return self._worker
-
-    @property
-    def worker_kinds(self) -> frozenset[str]:
-        """What the connected worker knows how to fetch. An older worker
-        build fetches pages only; it is never handed a reel job."""
-        return self._worker_kinds
 
     @property
     def pending(self) -> int:
@@ -502,7 +500,7 @@ class HomeFetchBroker:
         queue = self._get_queue()
         queued = 0
         for kind, key, username in wanted:
-            if self._cached((kind, key)) is not None or (kind, key) in self._by_key:
+            if self._cached((kind, key)) is not None or self._live_job((kind, key)):
                 continue
             self._enqueue(queue, kind, key, username, prefetch=True)
             queued += 1
@@ -518,7 +516,7 @@ class HomeFetchBroker:
         if not self.connected:
             return None
         loop = asyncio.get_running_loop()
-        if key not in self._by_key:
+        if self._live_job(key) is None:
             self._enqueue(self._get_queue(), key[0], key[1], username, prefetch=False)
         future: asyncio.Future[PageResult] = loop.create_future()
         self._waiters.setdefault(key, []).append(future)
@@ -556,6 +554,30 @@ class HomeFetchBroker:
         priority = 0 if kind == KIND_PAGE else 1
         queue.put_nowait((priority, self._seq, job))
         return job
+
+    def _live_job(self, key: tuple[str, str]) -> Optional[PageJob]:
+        """The job in flight for `key`, or None when there is none worth
+        waiting for.
+
+        Jobs only expired on their way OUT of the queue, so one the worker had
+        already taken and never answered stayed in flight for good — and
+        every later request for that account found it here and queued
+        nothing, which shut the home door for the account until the bot
+        restarted. A taken job is let go after HANDED_MAX_AGE_SECONDS, a
+        queued one after JOB_MAX_AGE_SECONDS; a late answer to either is then
+        refused (see deliver)."""
+        job = self._by_key.get(key)
+        if job is None:
+            return None
+        now = time.monotonic()
+        abandoned = now - job.created > JOB_MAX_AGE_SECONDS or (
+            job.handed is not None and now - job.handed > HANDED_MAX_AGE_SECONDS
+        )
+        if not abandoned:
+            return job
+        self._by_key.pop(key, None)
+        self._jobs.pop(job.id, None)
+        return None
 
     def _take(self, job: PageJob) -> bool:
         """Hand `job` out unless it was already answered or is stale."""

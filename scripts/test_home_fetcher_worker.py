@@ -100,7 +100,10 @@ class _Bot(BaseHTTPRequestHandler):
 
     def setup(self) -> None:
         super().setup()
-        _Bot.connections.add(id(self.connection))
+        # The peer's address and port, one pair per TCP connection. Not
+        # id(self.connection): Python 3.12 reuses the closed socket's id for
+        # the next one, which counted two connections as one.
+        _Bot.connections.add(self.client_address)
 
     def _answer(self) -> None:
         _Bot.seen_headers.append(dict(self.headers))

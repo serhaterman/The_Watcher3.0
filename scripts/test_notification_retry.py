@@ -24,7 +24,7 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "x")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "1")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
-from telegram.error import RetryAfter, TimedOut  # noqa: E402
+from telegram.error import BadRequest, RetryAfter, TimedOut  # noqa: E402
 
 from app.bot.notifications import _UPLOAD_TIMEOUTS, NotificationDispatcher  # noqa: E402
 from app.config import settings  # noqa: E402
@@ -157,6 +157,77 @@ async def test_retry_after_still_respected_for_uploads() -> None:
     )
 
 
+PARSE_ERROR = 'Can\'t parse entities: unsupported start tag "3" at byte offset 22'
+
+
+async def test_unparseable_text_goes_out_as_plain_text() -> None:
+    """A message whose markup Telegram rejects used to be resent unchanged
+    four times and then lost. It now goes out once more, as plain text — and
+    a literal "<3" in someone's name survives as text."""
+    d = make_dispatcher()
+    d.bot.send_message = AsyncMock(side_effect=[BadRequest(PARSE_ERROR), None])
+    started = asyncio.get_running_loop().time()
+    ok = await d.send_text("<b>@lis</b> renamed to Lisianna<3 &amp; co")
+    elapsed = asyncio.get_running_loop().time() - started
+    calls = d.bot.send_message.await_args_list
+    expect("delivered on the second try", ok and len(calls) == 2, f"calls={len(calls)}")
+    if len(calls) == 2:
+        kw = calls[1].kwargs
+        expect("the retry carries no parse mode", kw.get("parse_mode") is None, repr(kw))
+        expect("and the words without the markup",
+               kw.get("text") == "@lis renamed to Lisianna<3 & co", repr(kw.get("text")))
+    expect("without the backoff", elapsed < 1.0, f"{elapsed:.2f}s")
+
+
+async def test_unparseable_caption_goes_out_as_plain_text() -> None:
+    d = make_dispatcher()
+    d.bot.send_document = AsyncMock(side_effect=[BadRequest(PARSE_ERROR), None])
+    ok = await d.send_document(MEDIA, caption="<b>@lis</b> — Lisianna<3")
+    calls = d.bot.send_document.await_args_list
+    expect("the upload is delivered on the second try",
+           ok and len(calls) == 2, f"calls={len(calls)}")
+    if len(calls) == 2:
+        kw = calls[1].kwargs
+        expect("with a plain caption",
+               kw.get("parse_mode") is None and kw.get("caption") == "@lis — Lisianna<3",
+               repr((kw.get("parse_mode"), kw.get("caption"))))
+
+
+async def test_other_bad_requests_fail_at_once() -> None:
+    """Telegram answers the same 400 to the same request: one try, no 24 s
+    of backoff holding up the messages behind it."""
+    d = make_dispatcher()
+    d.bot.send_message = AsyncMock(side_effect=BadRequest("Chat not found"))
+    started = asyncio.get_running_loop().time()
+    ok = await d.send_text("hello")
+    elapsed = asyncio.get_running_loop().time() - started
+    expect("a rejected message reports failure",
+           ok is False and d.bot.send_message.await_count == 1,
+           f"ok={ok} calls={d.bot.send_message.await_count}")
+    expect("straight away", elapsed < 1.0, f"{elapsed:.2f}s")
+
+    plain = make_dispatcher()
+    plain.bot.send_message = AsyncMock(side_effect=BadRequest(PARSE_ERROR))
+    ok = await plain.send_text("<b>still</b> broken")
+    expect("a plain-text retry that also fails stops there",
+           ok is False and plain.bot.send_message.await_count == 2,
+           f"ok={ok} calls={plain.bot.send_message.await_count}")
+
+
+async def test_a_dead_topic_still_falls_back_to_general() -> None:
+    d = make_dispatcher()
+    d.bot.send_message = AsyncMock(
+        side_effect=[BadRequest("Message thread not found"), None]
+    )
+    ok = await d.send_text("hi", message_thread_id=7)
+    calls = d.bot.send_message.await_args_list
+    expect("resent to General", ok and len(calls) == 2
+           and calls[1].kwargs.get("message_thread_id") is None, repr(calls))
+    if len(calls) == 2:
+        expect("with its formatting kept",
+               calls[1].kwargs.get("parse_mode") == "HTML", repr(calls[1].kwargs))
+
+
 async def main() -> int:
     await test_upload_timeout_sends_once_no_retry()
     await test_video_timeout_sends_once()
@@ -165,6 +236,10 @@ async def main() -> int:
     await test_upload_success_path()
     await test_text_timeout_still_retries()
     await test_retry_after_still_respected_for_uploads()
+    await test_unparseable_text_goes_out_as_plain_text()
+    await test_unparseable_caption_goes_out_as_plain_text()
+    await test_other_bad_requests_fail_at_once()
+    await test_a_dead_topic_still_falls_back_to_general()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s): {FAILURES}")

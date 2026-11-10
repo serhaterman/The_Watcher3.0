@@ -83,16 +83,6 @@ async def remove_account(session: AsyncSession, username: str) -> bool:
     return result.rowcount > 0
 
 
-async def deactivate_account(session: AsyncSession, username: str) -> bool:
-    username = normalize_username(username)
-    result = await session.execute(
-        update(MonitoredAccount)
-        .where(MonitoredAccount.username == username)
-        .values(active=False)
-    )
-    return result.rowcount > 0
-
-
 async def set_account_active(
     session: AsyncSession, username: str, active: bool
 ) -> bool:
@@ -527,7 +517,9 @@ async def recent_notifications(
     stmt = (
         select(NotificationLog)
         .where(NotificationLog.account_id == account_id)
-        .order_by(desc(NotificationLog.created_at))
+        # id tiebreaker: SQLite stores created_at in whole seconds, and two
+        # events of one check land in the same one.
+        .order_by(desc(NotificationLog.created_at), desc(NotificationLog.id))
         .limit(limit)
     )
     result = await session.execute(stmt)
@@ -882,7 +874,7 @@ async def get_account_topic(
 ) -> Optional[int]:
     """Return the Telegram forum topic (message_thread_id) for an account."""
     raw = await get_setting(session, _topic_key(account_id))
-    if raw and raw.lstrip("-").isdigit():
+    if raw and raw.lstrip("-").isdecimal():
         return int(raw)
     return None
 

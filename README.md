@@ -62,6 +62,7 @@ Track any Instagram account — **public or private** — followers, bio, profil
 | ⏸ **Pause / resume targets** | Freeze monitoring with one tap or `/pause` — history, snapshots, and the resolved Instagram ID are all preserved. Resume picks up exactly where it left off. |
 | 🔎 **Any public account, on demand** | `/story @user` and `/highlights @user` grab media from **any** public account — no need to monitor it. Also available as the **🔎 Any user** menu button. |
 | ⬇️ **Download-all highlights** | One button fetches every highlight of an account, full quality. |
+| 🎞 **Highlight media, fresh copies only** | Since saveinsta began refusing every highlight (2026-10-23), highlight media come from storynavigation.com — login-free, free, no captcha. It fetches a highlight live once and then serves that same copy for a day or more, so the bot takes an answer only when it was fetched just now (or is the copy it fetched itself within 15 minutes). Otherwise you get the reason — *"only had a stored copy"*, *"sent nothing for this highlight"* — never an old copy passed off as current. Reels that existed before it came back got one quiet first listing, so nothing old arrives as new. |
 | 🔴 **Live & story status** | The account card shows `🔴 live now` / `🎬 has an active story` in real time — checked at the moment you open the card, not at the last sweep. |
 | 🖼 **Max-quality profile pictures** | Full-resolution avatars instead of the 320 px anonymous ceiling, with automatic fallback for accounts the high-res path can't reach. |
 | ⚡ **Faster everywhere** | Downloader tokens are cached, blocked endpoints fast-fail instead of timing out, and account cards render instantly. |
@@ -263,7 +264,7 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 
 | Variable | Default | Description |
 |---|---|---|
-| `TELEGRAM_ADMIN_IDS` | _(empty)_ | Comma-separated user IDs allowed to use the bot. Empty = allow all |
+| `TELEGRAM_ADMIN_IDS` | _(empty)_ | Comma-separated user IDs allowed to use the bot. Empty = only the chats the bot reports to (`TELEGRAM_CHAT_ID` and the mirrors) |
 | `TELEGRAM_WEBHOOK_URL` | _(empty)_ | Public base URL for webhook registration. Auto-inferred from `RENDER_EXTERNAL_URL` on Render |
 | `TELEGRAM_WEBHOOK_SECRET` | _(empty)_ | Optional secret validated against Telegram's `X-Telegram-Bot-Api-Secret-Token` header |
 | `TELEGRAM_WEBHOOK_PATH` | `/telegram/webhook` | Webhook path registered with Telegram and mounted by FastAPI |
@@ -354,7 +355,7 @@ The story/live status is reported from live reel data only — never re-read fro
 
 | Variable | Default | Description |
 |---|---|---|
-| `WEB_API_TOKEN` | _(empty)_ | If set, required as `X-API-Token` header for `/sweep` and `/accounts/*/recheck` |
+| `WEB_API_TOKEN` | _(empty)_ | Sent as the `X-API-Token` header. Required for `/status`, `/accounts`, `/sweep` and `/accounts/*/recheck`, which are all disabled while it is unset |
 | `PORT` | `8000` | Web server port |
 | `LOG_LEVEL` | `INFO` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
@@ -366,6 +367,7 @@ The story/live status is reported from live reel data only — never re-read fro
 |---|---|
 | `/start` or `/menu` | Open the main inline menu |
 | `/add <target>` | Start monitoring — accepts `@username`, `https://instagram.com/username`, or a numeric Instagram ID. Runs an immediate baseline fetch |
+| `/addmedia <target>` | Like `/add`, but the account alerts only on its stories, posts and avatar (follower, bio and name changes stay quiet). Switches an account already monitored to that mode |
 | `/remove <user>` | Stop monitoring and delete all stored history (`/rm` is an alias) |
 | `/pause <user>` | Pause monitoring — the target and its full history stay in the database |
 | `/resume <user>` | Resume a paused target exactly where it left off |
@@ -408,19 +410,20 @@ The story/live status is reported from live reel data only — never re-read fro
 
 ## 🔌 HTTP API
 
-All responses are JSON. Mutation endpoints require `X-API-Token` when `WEB_API_TOKEN` is configured.
+All responses are JSON. Endpoints marked **Token** take the `X-API-Token` header. They all answer 404 while `WEB_API_TOKEN` is unset: `/status` and `/accounts` expose what is being monitored, and `/sweep` would let anyone fire sweeps at Instagram.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET`/`HEAD` | `/health` | None | Liveness probe — returns `{"status":"ok"}` |
-| `GET` | `/ready` | None | Readiness probe — checks monitor and scheduler state |
-| `GET` | `/status` | None | Stats: account counts, last sweep time, scheduler info |
-| `GET` | `/accounts` | None | List all monitored accounts |
+| `GET`/`HEAD` | `/health` | None | Liveness probe — returns `{"ok":true}` |
+| `GET` | `/ready` | None | Readiness probe — monitor and scheduler state, plus the deployed `commit` |
+| `GET` | `/status` | Token | Stats: account counts, scheduler info, fetch health |
+| `GET` | `/accounts` | Token | List all monitored accounts |
 | `POST` | `/accounts/{username}/recheck` | Token | Force an immediate check for one account |
 | `POST` | `/sweep` | Token | Trigger a full sweep across all active accounts |
 
 ```bash
 curl -X POST https://<host>/sweep -H "X-API-Token: your-token"
+curl https://<host>/accounts -H "X-API-Token: your-token"
 ```
 
 ---
@@ -453,7 +456,8 @@ app/
 ├── database/       SQLAlchemy models, async session, CRUD helpers
 ├── monitor/        Instagram client, public-page fallback parser, anonymous media
 │                   downloader, change detector, perceptual hashing, sweep orchestrator
-├── utils/          Logging setup, user-agent rotation, formatting helpers
+├── utils/          Logging setup, formatting helpers, background tasks, the download
+│                   guard (media folders; public http(s) hosts only, every hop)
 ├── workers/        APScheduler-based sweep worker
 ├── config.py       Pydantic Settings — environment-driven configuration
 └── main.py         FastAPI app, lifespan wiring, service initialization

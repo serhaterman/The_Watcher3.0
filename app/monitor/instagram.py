@@ -121,7 +121,9 @@ class IdProbe:
     # {"has_public_story", "is_live", "highlights"} — the shape the story
     # phase consumes, so one probe serves the whole check.
     reel_data: Optional[dict[str, Any]] = None
-    # Which route answered: "cache", "worker", "direct", "home" (the phone).
+    # Which route answered: "cache", "worker", "direct", "home" (the phone);
+    # "worker-shut" when a sweep did not ask the Worker because it has been
+    # refusing (the status is then the refusal it last gave).
     via: str = ""
 
     @property
@@ -331,9 +333,11 @@ class InstagramClient:
         self._direct_page_tunnel_answered = False
         # The Worker's reel route. Refused per colo, and each refusal is ~9 s
         # of upstream retries; after a few in a row the phone is asked first
-        # for a while, the Worker only when the phone has no answer.
+        # for a while, the Worker only when the phone has no answer — and a
+        # sweep with no phone skips it (see probe_by_id).
         self._worker_reel_failures = 0
         self._worker_reel_blocked_until = 0.0
+        self._worker_reel_last_status = 0
         if session is not None:
             self._session: _SessionLike = session
             self._own_session = False
@@ -495,7 +499,12 @@ class InstagramClient:
         return parsed
 
     async def probe_by_id(
-        self, user_id: str, *, cached_ok: bool = False, ask_phone: bool = True
+        self,
+        user_id: str,
+        *,
+        cached_ok: bool = False,
+        ask_phone: bool = True,
+        knock_refusing: bool = True,
     ) -> IdProbe:
         """Ask Instagram about a NUMERIC id and report exactly what it said.
 
@@ -514,6 +523,14 @@ class InstagramClient:
         `ask_phone=False` keeps the phone out of the live routes: a sweep
         that has to ask after all (its page failed) must not then sit on a
         live phone request — the phone already had its chance at the page.
+
+        `knock_refusing=False` (sweeps) skips the Worker while it is known to
+        be refusing and no phone is asked instead: the route's last refusal
+        stands as the answer, as the username API's does. Measured 2026-11-05
+        with the route refusing every id since 11-04 and no phone: 8.5-9 s of
+        upstream retries on every failing account of every sweep. One knock
+        per cooldown still notices the route opening again; a manual check
+        (someone is waiting, and this is the only rename route) always knocks.
         """
         probe = IdProbe(user_id=str(user_id or ""))
         if not probe.user_id:
@@ -543,6 +560,10 @@ class InstagramClient:
 
         phone = phone and ask_phone
         worker_refusing = time.monotonic() < self._worker_reel_blocked_until
+        if worker_refusing and not phone and not knock_refusing:
+            probe.status = self._worker_reel_last_status
+            probe.via = "worker-shut"
+            return probe
         order = ["home", "worker"] if (phone and worker_refusing) else ["worker", "home"]
         status, parsed = 0, None
         for route in order:
@@ -569,14 +590,16 @@ class InstagramClient:
             self._worker_reel_blocked_until = 0.0
             return
         self._worker_reel_failures += 1
+        self._worker_reel_last_status = status
         if (
             self._worker_reel_failures >= self._WORKER_REEL_BREAKER_FAILURES
             and time.monotonic() >= self._worker_reel_blocked_until
         ):
             self._worker_reel_blocked_until = time.monotonic() + self._WORKER_REEL_COOLDOWN
             logger.info(
-                "The Worker's reel route was refused {} times in a row — asking "
-                "the home fetcher first for the next {:.0f} min",
+                "The Worker's reel route was refused {} times in a row — for the "
+                "next {:.0f} min the home fetcher is asked first, and a sweep "
+                "without one skips the route",
                 self._worker_reel_failures, self._WORKER_REEL_COOLDOWN / 60,
             )
 
@@ -898,13 +921,26 @@ class InstagramClient:
                         )
 
                 if response.status_code == 404:
-                    fetch_health.record_status(IG_PROFILE, 404)
-                    return ProfileFetchResult(
-                        username=username,
-                        http_status=404,
-                        error="User not found",
-                        api_status=404,
+                    # Not an answer any more. Since 2026-11-04 this API
+                    # returns 404 — an HTML "Page Not Found" — for EVERY
+                    # username, @instagram included (measured through the
+                    # Worker that day). Handed up as "User not found", it kept
+                    # the page doors from ever being asked and sent live
+                    # accounts "not found" alerts, two sweeps running. So it
+                    # is booked as the refusal it is, like a 401: the page
+                    # doors are asked below, and only they (a profile, or the
+                    # page's own 404) or the numeric-id route may say an
+                    # account is gone. No re-ask — it answers the same at once.
+                    logger.warning(
+                        "HTTP 404 on @{} from the username API — its answer for "
+                        "every username now, so not a verdict", username,
                     )
+                    last_status = 401  # stands in for the refusal it is
+                    last_error = (
+                        "HTTP 404 from the username API (its answer for every "
+                        "username now, so not a verdict)"
+                    )
+                    break
 
                 if response.status_code == 429:
                     delay = min(60.0, (2 ** attempt) * 4.0 + jitter)
@@ -1085,10 +1121,13 @@ class InstagramClient:
         door = outcome.get("door") or "direct"
         if door == "direct" and outcome.get("route") not in (None, "this host"):
             door = f"direct, via {outcome['route']}"
+        # Counted against PARTIAL_FIELDS only: the reading also carries
+        # extras (story status, highlights, grid) that are not profile fields.
         logger.info(
             "@{} answered on the public page ({}) after the API blocked us — "
             "partial data ({} of {} fields)",
-            username, door, len(parsed), len(PARTIAL_FIELDS),
+            username, door, sum(1 for f in PARTIAL_FIELDS if f in parsed),
+            len(PARTIAL_FIELDS),
         )
         return ProfileFetchResult(
             username=username,
@@ -1257,6 +1296,8 @@ class InstagramClient:
             self._direct_page_failures = 0
             self._direct_page_blocked_until = 0.0
             self._direct_page_tunnel_answered = False
+            if outcome.get("route") == page_tunnel.TUNNEL_ROUTE:
+                page_tunnel.tunnel.report_answered()  # the exit a restart starts on
             return
         if outcome.get("status") == 404:
             return

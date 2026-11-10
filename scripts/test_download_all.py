@@ -25,6 +25,8 @@ if DB_FILE.exists():
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "x")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "1")
+# The fake user (99) drives the handlers as an admin, as a real one would.
+os.environ.setdefault("TELEGRAM_ADMIN_IDS", "99")
 os.environ.setdefault("DATABASE_URL", f"sqlite+aiosqlite:///{DB_FILE.as_posix()}")
 
 from app.bot import handlers, keyboards  # noqa: E402

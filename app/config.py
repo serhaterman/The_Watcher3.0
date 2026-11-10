@@ -269,10 +269,13 @@ class Settings(BaseSettings):
     # count; a request through its public edge does. So the app asks its own
     # public /health this often: every 5 minutes, so even a ping that fails
     # leaves the next one inside the 15. Render sets RENDER_EXTERNAL_URL
-    # itself; with no URL, or 0 here, nothing is pinged. Always-on fits the
-    # free plan's 750 instance hours a month for one service.
+    # itself (the field is declared with the Telegram settings above); with
+    # no URL, or 0 here, nothing is pinged. Always-on fits the free plan's
+    # 750 instance hours a month for one service.
     keep_awake_seconds: int = Field(default=300, alias="KEEP_AWAKE_SECONDS")
-    render_external_url: Optional[str] = Field(default=None, alias="RENDER_EXTERNAL_URL")
+    # Render injects the deployed commit's SHA. /ready (public) and /status
+    # report it, so a deploy can be confirmed live instead of assumed.
+    render_git_commit: Optional[str] = Field(default=None, alias="RENDER_GIT_COMMIT")
 
     # Optional proxy (single URL applied to both http and https)
     proxy_url: Optional[str] = Field(default=None, alias="PROXY_URL")
@@ -310,7 +313,7 @@ class Settings(BaseSettings):
         out: List[int] = []
         for chunk in self.home_fetch_battery_alerts.split(","):
             chunk = chunk.strip()
-            if not chunk.isdigit():
+            if not chunk.isdecimal():
                 continue
             level = max(1, min(100, int(chunk)))
             if level not in out:
@@ -324,7 +327,7 @@ class Settings(BaseSettings):
         out: List[int] = []
         for chunk in self.telegram_admin_ids.split(","):
             chunk = chunk.strip()
-            if chunk.isdigit() or (chunk.startswith("-") and chunk[1:].isdigit()):
+            if chunk.isdecimal() or (chunk.startswith("-") and chunk[1:].isdecimal()):
                 out.append(int(chunk))
         return out
 
@@ -337,7 +340,7 @@ class Settings(BaseSettings):
             chunk = chunk.strip()
             if not chunk:
                 continue
-            if chunk.lstrip("-").isdigit():
+            if chunk.lstrip("-").isdecimal():
                 out.append(int(chunk))
             else:
                 out.append(chunk)

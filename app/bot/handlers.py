@@ -65,6 +65,7 @@ HELP_TEXT = (
     "<b>Commands</b>\n"
     "<code>/add @user</code>, <code>/add https://instagram.com/user</code>, or <code>/add 1234567890</code> — start monitoring\n"
     "<code>/add user1 user2 user3</code> — add several at once (space/comma/newline separated)\n"
+    "<code>/addmedia @user</code> — add with alerts for stories, posts &amp; avatar only (or switch one already monitored)\n"
     "<code>/remove @user</code> — stop monitoring\n"
     "<code>/pause @user</code> · <code>/resume @user</code> — pause/resume a target\n"
     "<code>/list</code> — all accounts\n"
@@ -95,6 +96,7 @@ HELP_TEXT = (
 BOT_COMMANDS: list[BotCommand] = [
     BotCommand("menu", "Open the main menu"),
     BotCommand("add", "Start monitoring an account"),
+    BotCommand("addmedia", "Monitor an account for stories, posts & avatar only"),
     BotCommand("remove", "Stop monitoring an account"),
     BotCommand("pause", "Pause monitoring an account"),
     BotCommand("resume", "Resume monitoring an account"),
@@ -204,12 +206,36 @@ _INTERVAL_RE = re.compile(
 
 # ---------- Authorization ----------
 
+def _configured_chat_ids() -> set[int]:
+    """The chats the bot reports to: TELEGRAM_CHAT_ID and the mirrors (an
+    "@channel" name cannot match an update's numeric id, so it is skipped)."""
+    ids = {settings.telegram_chat_id, *settings.mirror_chat_ids}
+    return {int(i) for i in ids if str(i).lstrip("-").isdecimal()}
+
+
+def describe_access() -> str:
+    """Who may drive the bot, in words, for the startup log."""
+    if settings.admin_ids:
+        count = len(settings.admin_ids)
+        return f"TELEGRAM_ADMIN_IDS ({count} id{'s' if count != 1 else ''})"
+    count = len(_configured_chat_ids())
+    return (
+        f"the {count} chat{'s' if count != 1 else ''} notifications go to "
+        "(TELEGRAM_CHAT_ID and mirrors) — set TELEGRAM_ADMIN_IDS to name people"
+    )
+
+
 def _is_authorized(update: Update) -> bool:
-    admins = settings.admin_ids
-    if not admins:
-        return True
+    """Whether this update may drive the bot.
+
+    With TELEGRAM_ADMIN_IDS set, those users and chats. Without it the bot
+    used to answer ANYONE who found it — list, add and remove targets, run
+    sweeps, download media. It now answers the chats it reports to and
+    nobody else; set TELEGRAM_ADMIN_IDS to name people instead.
+    """
     user = update.effective_user
     chat = update.effective_chat
+    admins = settings.admin_ids or _configured_chat_ids()
     if user and user.id in admins:
         return True
     if chat and chat.id in admins:
@@ -220,10 +246,20 @@ def _is_authorized(update: Update) -> bool:
 async def _reject_if_unauthorized(update: Update) -> bool:
     if _is_authorized(update):
         return False
+    text = "Unauthorized."
+    chat, user = update.effective_chat, update.effective_user
+    if not settings.admin_ids and chat and user and chat.type == "private":
+        # The default lets in only the chats the bot reports to, which can
+        # leave its owner refused in a DM. Say how to get in from here: only
+        # the owner can act on it, and the id shown is the reader's own.
+        text = (
+            "Unauthorized. This bot answers only the chats it reports to. To use "
+            f"it here, add your Telegram id {user.id} to TELEGRAM_ADMIN_IDS."
+        )
     if update.callback_query:
-        await update.callback_query.answer("Unauthorized.", show_alert=True)
+        await update.callback_query.answer(text, show_alert=True)
     elif update.message:
-        await update.message.reply_text("Unauthorized.")
+        await update.message.reply_text(text)
     return True
 
 
@@ -237,7 +273,9 @@ def _username_arg(context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
 
 def _normalize_username(raw: str) -> Optional[str]:
     raw = raw.strip().lstrip("@")
-    if not raw or not _USERNAME_RE.match(raw):
+    # Dots alone ("." or "..") match the pattern but are no Instagram handle
+    # — and ".." named the folder above the media root.
+    if not raw or not _USERNAME_RE.match(raw) or not raw.strip("."):
         return None
     return raw.lower()
 
@@ -264,7 +302,7 @@ def _parse_add_target(raw: str) -> tuple[Optional[str], Optional[str]]:
     if match:
         path = match.group(1)
         if _INSTAGRAM_ID_RE.match(path):
-            return None, path
+            return None, str(int(path))
         return _normalize_username(path), None
 
     # Anything else that carries URL structure (a scheme or a path separator) is
@@ -277,7 +315,9 @@ def _parse_add_target(raw: str) -> tuple[Optional[str], Optional[str]]:
     if not candidate:
         return None, None
     if _INSTAGRAM_ID_RE.match(candidate):
-        return None, candidate
+        # str(int(...)): "\d" matches any script's digits, and Arabic
+        # keyboards type ١٢٣ — the id Instagram knows is ASCII.
+        return None, str(int(candidate))
     return _normalize_username(candidate), None
 
 
@@ -286,7 +326,7 @@ def _parse_interval(raw: str) -> Optional[int]:
     text = raw.strip().lower()
     if not text:
         return None
-    if text.isdigit():
+    if text.isdecimal():
         n = int(text)
         return n or None
     m = _INTERVAL_RE.match(text)
@@ -1177,7 +1217,13 @@ async def _do_add(
     context: ContextTypes.DEFAULT_TYPE,
     username: str,
     instagram_id: Optional[str] = None,
+    *,
+    media_only: bool = False,
 ) -> None:
+    """Add one account and run its first check. `media_only` (/addmedia)
+    switches it to alerting only on its stories, posts and avatar, in the
+    same transaction that adds it — so the first check already runs that
+    way — or switches an account that was already monitored."""
     user_id = update.effective_user.id if update.effective_user else None
     chat_id = _chat_id(update)
 
@@ -1188,18 +1234,25 @@ async def _do_add(
             added_by=user_id,
             instagram_id=instagram_id,
         )
+        if media_only:
+            await crud.set_media_only(session, account.id, True)
 
     if not created:
+        note = (
+            " — now alerting only on its stories, posts and avatar."
+            if media_only else "."
+        )
         await _reply_or_edit(
             update,
-            f"<b>@{esc(account.username)}</b> is already being monitored.",
+            f"<b>@{esc(account.username)}</b> is already being monitored{note}",
             reply_markup=keyboards.open_account(account.username),
         )
         return
 
+    mode = " — stories, posts and avatar only" if media_only else ""
     status_msg = await _reply_or_edit(
         update,
-        f"Now monitoring <b>@{esc(account.username)}</b>.\nRunning first check…",
+        f"Now monitoring <b>@{esc(account.username)}</b>{mode}.\nRunning first check…",
         reply_markup=keyboards.open_account(account.username),
     )
 
@@ -1253,6 +1306,8 @@ async def _do_add_bulk(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     tokens: list[str],
+    *,
+    media_only: bool = False,
 ) -> None:
     """Add several accounts from one message, then check them in the background.
 
@@ -1260,6 +1315,8 @@ async def _do_add_bulk(
     id). Adds are persisted immediately and a summary is sent; first checks run
     afterwards in the background so the reply isn't held up by 11 network round
     trips. New accounts baseline silently on that first check (no story flood).
+    `media_only` (/addmedia) puts every one of them, new or already monitored,
+    on stories, posts and avatar alerts only.
     """
     user_id = update.effective_user.id if update.effective_user else None
     chat_id = _chat_id(update)
@@ -1290,9 +1347,13 @@ async def _do_add_bulk(
             account, was_created = await crud.add_account(
                 session, username, added_by=user_id, instagram_id=instagram_id
             )
+            if media_only:
+                await crud.set_media_only(session, account.id, True)
             (created if was_created else already).append(account.username)
 
     lines = [f"📥 <b>Bulk add</b> — {len(tokens)} entr{'y' if len(tokens) == 1 else 'ies'}"]
+    if media_only:
+        lines.append("🎞 Alerts: stories, posts and avatar only")
     if created:
         lines.append(
             f"\n✅ <b>Added ({len(created)})</b>: "
@@ -1617,7 +1678,7 @@ async def _download_highlight(
 ) -> None:
     """Download one highlight (by its list index) and send its items."""
     query = update.callback_query
-    if not index_raw.lstrip("-").isdigit():
+    if not index_raw.lstrip("-").isdecimal():
         await _safe_answer(query, "Invalid highlight.")
         return
     await _safe_answer(query, "Downloading…")
@@ -1647,7 +1708,7 @@ async def _toggle_highlight_tracking(
 ) -> None:
     """Mute/unmute the sweep auto-download for one highlight, then re-render."""
     query = update.callback_query
-    if not index_raw.lstrip("-").isdigit():
+    if not index_raw.lstrip("-").isdecimal():
         await _safe_answer(query, "Invalid highlight.")
         return
     service: MonitorService = context.application.bot_data["monitor"]
@@ -1895,7 +1956,7 @@ async def _run_bundle_download(
     instagram_id = state.get("instagram_id") if state_ok else None
 
     hl_indexes = sorted(
-        int(t[1:]) for t in tokens if t.startswith("h") and t[1:].isdigit()
+        int(t[1:]) for t in tokens if t.startswith("h") and t[1:].isdecimal()
     )
     want_story = everything or "story" in tokens
     want_pic = everything or "pic" in tokens
@@ -2092,7 +2153,7 @@ async def _handle_download(
         await _safe_answer(query)
         page = (
             int(parts[1])
-            if len(parts) > 1 and parts[1].lstrip("-").isdigit()
+            if len(parts) > 1 and parts[1].lstrip("-").isdecimal()
             else 0
         )
         async with get_session() as session:
@@ -2144,7 +2205,7 @@ async def _handle_download(
         items = state.get("items", [])
         valid = token in _DL_FIXED_TOKENS or (
             token.startswith("h")
-            and token[1:].isdigit()
+            and token[1:].isdecimal()
             and int(token[1:]) < len(items)
         )
         if not valid:
@@ -2252,38 +2313,68 @@ async def _resolve_username_for_instagram_id(
     return await service.instagram.fetch_username_by_id(instagram_id)
 
 
-async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await _reject_if_unauthorized(update):
+async def _add_from_args(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, media_only: bool
+) -> None:
+    """/add's and /addmedia's arguments: one target or several (username,
+    profile URL or numeric id), added and first-checked."""
+    tokens = _split_add_targets(" ".join(context.args))
+    if len(tokens) > 1:
+        await _do_add_bulk(update, context, tokens, media_only=media_only)
         return
-    if context.args:
-        tokens = _split_add_targets(" ".join(context.args))
-        if len(tokens) > 1:
-            await _do_add_bulk(update, context, tokens)
-            return
-        username, instagram_id = _parse_add_target(tokens[0] if tokens else context.args[0])
-        if not username and not instagram_id:
+    username, instagram_id = _parse_add_target(tokens[0] if tokens else context.args[0])
+    if not username and not instagram_id:
+        await update.message.reply_text(
+            "That doesn't look like a valid Instagram username or numeric user ID. "
+            "Letters, numbers, dots, and underscores only (max 30 chars).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.back_to_menu(),
+        )
+        return
+    if instagram_id:
+        username = await _resolve_username_for_instagram_id(
+            context, instagram_id
+        )
+        if not username:
             await update.message.reply_text(
-                "That doesn't look like a valid Instagram username or numeric user ID. "
-                "Letters, numbers, dots, and underscores only (max 30 chars).",
+                "Could not resolve that Instagram ID to a username. "
+                "Try a current numeric user ID or use @username instead.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=keyboards.back_to_menu(),
             )
             return
-        if instagram_id:
-            username = await _resolve_username_for_instagram_id(
-                context, instagram_id
-            )
-            if not username:
-                await update.message.reply_text(
-                    "Could not resolve that Instagram ID to a username. "
-                    "Try a current numeric user ID or use @username instead.",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=keyboards.back_to_menu(),
-                )
-                return
-            await _do_add(update, context, username, instagram_id=instagram_id)
-            return
-        await _do_add(update, context, username)
+        await _do_add(
+            update, context, username, instagram_id=instagram_id,
+            media_only=media_only,
+        )
+        return
+    await _do_add(update, context, username, media_only=media_only)
+
+
+async def cmd_addmedia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/add, with the account alerting only on its stories, posts and avatar
+    from the start — the card's 🎞 Media only switch, without the detour."""
+    if await _reject_if_unauthorized(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: <code>/addmedia &lt;username&gt;</code> — or a profile URL, a "
+            "numeric user ID, or several of them.\n"
+            "Adds the account with alerts for its <b>stories, posts and avatar "
+            "only</b>; follower, bio and name changes stay quiet. An account "
+            "already monitored is switched to that mode.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.back_to_menu(),
+        )
+        return
+    await _add_from_args(update, context, media_only=True)
+
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    if context.args:
+        await _add_from_args(update, context, media_only=False)
         return
     # No argument: enter the username-prompt state.
     # Clear any lingering prompt from a previous interaction first.
@@ -3270,7 +3361,7 @@ async def _handle_menu(
         await _safe_answer(query)
         page = (
             int(parts[1])
-            if len(parts) > 1 and parts[1].lstrip("-").isdigit()
+            if len(parts) > 1 and parts[1].lstrip("-").isdecimal()
             else 0
         )
         async with get_session() as session:
@@ -3373,7 +3464,7 @@ async def _handle_menu(
                 reply_markup=keyboards.cancel_only(),
             )
             return
-        if not choice.isdigit():
+        if not choice.isdecimal():
             await _safe_answer(query, "Invalid preset.")
             return
         seconds = int(choice)
@@ -3688,6 +3779,16 @@ async def _handle_account(
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Telegram handler error: {}", context.error)
+    # Say so to whoever tapped. A handler that raised left the button's
+    # spinner turning until Telegram gave up on it, with no word of why.
+    # Best-effort: the query may already be answered, or too old to answer.
+    if isinstance(update, Update) and update.callback_query is not None:
+        try:
+            await update.callback_query.answer(
+                "Something went wrong — please try again.", show_alert=True
+            )
+        except TelegramError:
+            pass
 
 
 async def _unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3707,6 +3808,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("addmedia", cmd_addmedia))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("rm", cmd_remove))
     app.add_handler(CommandHandler("pause", cmd_pause))

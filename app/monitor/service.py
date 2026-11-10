@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import random
+import re
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -15,6 +17,7 @@ from app.bot.notifications import (
     render_changes_message,
     render_digest,
     render_failure_message,
+    render_found_again_message,
     render_highlight_catalog_changes,
     render_new_stories_alert,
     render_not_found_message,
@@ -46,6 +49,7 @@ from app.monitor.media_hasher import (
     image_size,
     pic_asset_id,
 )
+from app.monitor.public_page import strip_bidi
 from app.monitor.stories import StoriesClient
 from app.utils.formatting import esc, fmt_timestamp
 from app.utils.logger import logger
@@ -104,6 +108,10 @@ _SWEEP_BREAKER_MAX_PAUSES = 2
 # A 404 is a real answer (read against the numeric-id route in _do_check and
 # surfaced by _handle_failure), not a block to retry.
 _RETRIABLE_STATUSES = (401, 403, 429, 0)
+
+# What a username may be before it is stored or names a folder: Instagram's
+# alphabet, up to 30 characters (the same rule as the bot's commands).
+_VALID_HANDLE = re.compile(r"[a-z0-9._]{1,30}")
 
 # app_settings key holding when a sweep last found the username API refusing
 # every lookup. Read by the next sweep (one knock instead of a threshold's
@@ -192,6 +200,15 @@ def _is_stale_pic(
     if now - since > _STALE_PIC_WINDOW:
         return False
     return current_asset in {pic_asset_id(url) for url, _at in older}
+
+
+def _json_ids(raw: Optional[str]) -> set[str]:
+    """A stored JSON list of ids as a set; an unreadable one as empty."""
+    try:
+        value = json.loads(raw) if raw else []
+    except ValueError:
+        return set()
+    return {str(v) for v in value} if isinstance(value, list) else set()
 
 
 def _parse_utc(raw: Optional[str]) -> Optional[datetime]:
@@ -289,9 +306,19 @@ class _SweepThrottle:
         self._lock = asyncio.Lock()
         self._next_slot = 0.0  # monotonic time the next check may proceed
         self._pause_until = 0.0  # monotonic time the guard's cooldown ends
+        # Set when the breaker opens, so a check waiting out its gap wakes
+        # to be skipped instead of sleeping for a request it won't make.
+        self._opened = asyncio.Event()
+        # The page-tunnel exit the last booked check went out through: blocks
+        # are counted per exit (see record).
+        self._page_exit: Optional[str] = None
 
     def is_open(self) -> bool:
         return self._open
+
+    def _trip(self) -> None:
+        self._open = True
+        self._opened.set()
 
     @property
     def tripped(self) -> bool:
@@ -328,7 +355,8 @@ class _SweepThrottle:
     def username_door_closed(self) -> bool:
         """True once `breaker_threshold` username lookups in a row were
         refused with none answering this sweep. From then on the remaining
-        accounts are checked by numeric id only: that door is shut, and every
+        accounts skip the username API and go straight to the page doors (and
+        the numeric id when no page answers): that door is shut, and every
         further knock is blocked traffic for an answer already known."""
         return self._username_door_closed
 
@@ -367,6 +395,7 @@ class _SweepThrottle:
         *,
         id_status: Optional[int] = None,
         api_status: Any = _NOT_GIVEN,
+        page_exit: Optional[str] = None,
     ) -> None:
         """Book one check. `status` is the username side's overall answer
         (the API or, failing that, a page door — None when nothing on that
@@ -379,7 +408,23 @@ class _SweepThrottle:
         any route answered is a success for pacing and for the gate. The gate
         is down when Instagram answers NOTHING — not when one of its doors is
         shut, which since 2026-09-05 is the normal state of the username API.
+
+        `page_exit` is the page-tunnel exit the check went out through (None
+        when pages left from this host). Blocks are counted per exit: a new
+        exit starts the count over, since one Instagram refuses says nothing
+        about the next. Measured 2026-11-05: three blocks on one exit and two
+        on the next tripped the breaker before the third exit, which then
+        answered all 17 accounts, was ever tried.
         """
+        if page_exit and page_exit != self._page_exit:
+            if self._page_exit is not None and self._consecutive_auth_fails:
+                logger.info(
+                    "The page tunnel moved on to {} — the sweep counts its "
+                    "blocks afresh there ({} booked on {})",
+                    page_exit, self._consecutive_auth_fails, self._page_exit,
+                )
+                self._consecutive_auth_fails = 0
+            self._page_exit = page_exit
         door = status if api_status is _NOT_GIVEN else api_status
         user_blocked = door in (401, 403)
         user_ok = door == 200
@@ -403,8 +448,9 @@ class _SweepThrottle:
                 self._username_door_closed = True
                 logger.warning(
                     "Instagram refused {} username lookups in a row and "
-                    "answered none — checking the rest of the sweep by "
-                    "numeric id only", self._consecutive_user_blocks,
+                    "answered none — the rest of the sweep skips the username "
+                    "API and reads the page (the numeric id if no page "
+                    "answers)", self._consecutive_user_blocks,
                 )
 
         # Instagram answered if the username side came back 200 — from the
@@ -442,7 +488,7 @@ class _SweepThrottle:
                     # out of — stop now rather than spend the rest of the
                     # sweep proving it.
                     self._gate_down = True
-                    self._open = True
+                    self._trip()
                     logger.warning(
                         "Instagram's gate is blocking every request ({} in a "
                         "row, 0 answered) — stopping the sweep instead of "
@@ -460,7 +506,7 @@ class _SweepThrottle:
                         self._cooldown, streak, self._pauses, self._max_pauses,
                     )
                 else:
-                    self._open = True
+                    self._trip()
         # A 404/429/0 on the username route with nothing else asked leaves
         # pacing unchanged — that isn't the datacenter block.
 
@@ -487,8 +533,13 @@ class _SweepThrottle:
                 depart = max(now, self._next_slot, self._pause_until)
                 self._next_slot = depart + self.current_stagger
             wait = depart - now
-            if wait > 0:
-                await asyncio.sleep(wait)
+            if wait > 0 and not self._open:
+                # Cut short when the breaker opens meanwhile: the caller then
+                # skips at once. Measured 2026-11-05: the 12 checks queued
+                # behind a stopped sweep sat out ~150 s of gaps one by one,
+                # each holding the lane, just to be skipped.
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._opened.wait(), wait)
             try:
                 yield
             finally:
@@ -526,6 +577,9 @@ class MonitorService:
         # the story phase barely touches Instagram. Same size, so neither
         # side fans out wider than before.
         self._story_semaphore = asyncio.Semaphore(settings.max_concurrent_fetches)
+        # (account_id, phase) -> the lock that keeps two checks, or two story
+        # phases, of one account from running at once. See _account_lock.
+        self._account_locks: dict[tuple[int, str], asyncio.Lock] = {}
         # When a sweep last found the username API refusing every lookup
         # (None = it was answering). Loaded from app_settings on first use so
         # the memory survives a restart; see username_api_known_closed().
@@ -1277,13 +1331,16 @@ class MonitorService:
 
         # Which of them may spend a live reel call on their highlight catalog.
         #
-        # The catalog has exactly one source — the reel query — and while the
-        # profile API is shut, nothing free carries it: the page has never
-        # known it, the Worker's reel route is refused per colo, and the phone
-        # is 429'd on it. So the story phase, which correctly refuses to
-        # re-ask the reel route for a STATUS the page already answered, was
-        # also declining to ask for a catalog nothing else can answer — and
-        # the stored one quietly aged.
+        # A check that read the page usually needs none: the page lists a
+        # public account's whole catalog (see public_page._highlight_catalog,
+        # read since 2026-11-04), so such an account is skipped here. When it
+        # does not — a list Instagram marks as having a next page, or no page
+        # reading at all — the reel query is the only source left, and while
+        # the profile API is shut it is refused per colo (by 2026-11-04 it
+        # answered "require_login" even from a home IP). The story phase
+        # correctly refuses to re-ask the reel route for a STATUS the page
+        # already answered; without this it would also decline to ask for a
+        # catalog nothing else answered, and the stored one would quietly age.
         #
         # A catalog is not a status, though. It changes when its owner adds a
         # highlight, it is re-listed at most once per HIGHLIGHT_SCAN_INTERVAL
@@ -1293,9 +1350,11 @@ class MonitorService:
         # source) cannot turn into seventeen of them; the sweep order is
         # shuffled, so over a few sweeps every due account gets its turn.
         catalog_refresh: set[int] = set()
-        for aid, _, ig_id, _ in story_targets:
+        for aid, _, ig_id, reel in story_targets:
             if len(catalog_refresh) >= _CATALOG_REFRESH_PER_SWEEP:
                 break
+            if reel is not None and reel.get("highlights") is not None:
+                continue
             if ig_id and self._highlight_scan_overdue(aid, highlight_stamps):
                 catalog_refresh.add(aid)
         if catalog_refresh:
@@ -1781,6 +1840,9 @@ class MonitorService:
             # fetching its own page now, so a handover triggered by its own
             # refusal must not ask the phone for it a second time.
             throttle.note_started(username)
+            # Read before the check: a move the check itself sets off is the
+            # next check's exit, not this one's.
+            page_exit = self._page_exit()
             result = await self._run_check(
                 account_id, username, thorough=False,
                 skip_username_api=throttle.username_door_closed,
@@ -1796,6 +1858,7 @@ class MonitorService:
                 result.get("status"),
                 id_status=result.get("id_status"),
                 api_status=result.get("api_status", _NOT_GIVEN),
+                page_exit=page_exit,
             )
             # The moment to hand the home fetcher the rest of the list is
             # when BOTH username-side doors have failed for this account: the
@@ -1934,6 +1997,16 @@ class MonitorService:
         return recovered
 
     @staticmethod
+    def _page_exit() -> Optional[str]:
+        """The page-tunnel exit profile pages leave from now, named for the
+        log ("NL-FREE#158 (185.107.56.154)"); None when they leave from this
+        host."""
+        tunnel = page_tunnel.tunnel
+        if not (tunnel.up and tunnel.egress_ip):
+            return None
+        return f"{tunnel.label} ({tunnel.egress_ip})"
+
+    @staticmethod
     def _page_doors_signature() -> tuple[int, bool]:
         """What can make an account refused by id answer on the next round:
         the page tunnel coming (back) up, or the phone connecting."""
@@ -1969,7 +2042,7 @@ class MonitorService:
         rhythm instead of arriving on top of it. Every check stamps the clock
         on the way out, sweep checks included, or the sweep's own traffic
         would be invisible to the gate."""
-        async with self._semaphore:
+        async with self._account_lock(account_id, "check"), self._semaphore:
             if not paced:
                 await self._await_off_schedule_slot()
             try:
@@ -1986,6 +2059,23 @@ class MonitorService:
                 return {"ok": False, "username": username, "error": repr(exc)}
             finally:
                 self._last_check_at = time.monotonic()
+
+    def _account_lock(self, account_id: int, phase: str) -> asyncio.Lock:
+        """The lock for one account's check ("check") or story phase
+        ("story").
+
+        Checks share a three-slot semaphore, and nothing kept two of them off
+        the same account: a sweep check, a stakeout tick and a card Recheck
+        landing together each read the same previous snapshot and announced
+        the same change, and two story phases each loaded the seen-set before
+        either marked anything, so one story went out twice. The second now
+        waits and then reads what the first wrote. One lock per phase, since
+        check_username runs the two one after the other, never nested."""
+        key = (account_id, phase)
+        lock = self._account_locks.get(key)
+        if lock is None:
+            lock = self._account_locks[key] = asyncio.Lock()
+        return lock
 
     async def _await_off_schedule_slot(self) -> None:
         """Hold an off-schedule check back until the gap has passed.
@@ -2049,7 +2139,7 @@ class MonitorService:
         if instagram_id:
             clock = time.monotonic()
             probe = await self.instagram.probe_by_id(
-                instagram_id, cached_ok=not thorough
+                instagram_id, cached_ok=not thorough, knock_refusing=thorough
             )
             timings[f"id/{probe.via}" if probe.via else "id"] = time.monotonic() - clock
             if probe.gone:
@@ -2108,7 +2198,7 @@ class MonitorService:
             # failed.
             clock = time.monotonic()
             probe = await self.instagram.probe_by_id(
-                instagram_id, ask_phone=False
+                instagram_id, ask_phone=False, knock_refusing=thorough
             )
             timings[f"id/{probe.via or 'live'}"] = time.monotonic() - clock
             if probe.gone:
@@ -2229,6 +2319,15 @@ class MonitorService:
         new = (new or "").strip().lstrip("@").lower()
         old = (old or "").strip().lstrip("@").lower()
         if not new or new == old:
+            return old
+        if not _VALID_HANDLE.fullmatch(new) or not new.strip("."):
+            # The new name came from Instagram's payload (or the id route's),
+            # not from a validated command: one that is no Instagram handle
+            # is not stored, nor used to name a media folder.
+            logger.warning(
+                "@{}: ignoring a rename to {!r}, which is not an Instagram "
+                "username", old, new,
+            )
             return old
         async with get_session() as session:
             account = await session.get(MonitoredAccount, account_id)
@@ -2362,6 +2461,13 @@ class MonitorService:
                     message=msg,
                     delivered=delivered,
                 )
+                if change_type == "not_found":
+                    # Standing until the account next answers — what
+                    # _clear_not_found corrects, and the only thing it does.
+                    await crud.set_setting(
+                        session, self._not_found_key(account_id),
+                        datetime.now(timezone.utc).isoformat(),
+                    )
 
         return {
             "ok": False,
@@ -2561,15 +2667,16 @@ class MonitorService:
             }
         elif fetch.partial and "has_public_story" in parsed:
             # The id route did not answer, but the page did — and the page
-            # says whether a story is up (latest_reel_media). It knows neither
-            # a live broadcast nor the highlight catalog, so those stay
-            # unknown; the story phase is told where this came from so it
-            # neither knocks on the refused reel route again nor touches the
-            # stored catalog.
+            # says whether a story is up (latest_reel_media). It does not know
+            # a live broadcast. It knows the highlight catalog when Instagram
+            # lists all of it there (see public_page._highlight_catalog), and
+            # otherwise that stays unknown (None). The story phase is told
+            # where this came from so it does not knock on the refused reel
+            # route for what the page already answered.
             reel_data_response = {
                 "has_public_story": bool(parsed["has_public_story"]),
                 "is_live": False,
-                "highlights": None,
+                "highlights": parsed.get("highlights"),
                 "from_page": True,
             }
             logger.debug(
@@ -2812,6 +2919,7 @@ class MonitorService:
             new_pic_path=hashed.local_path if hashed else None,
             notify_unchanged=notify_unchanged,
         )
+        await self._clear_not_found(account_id, username)
 
         # New post/reel auto-download for public accounts (login-free via
         # saveinsta). On the first observation we just baseline what's already
@@ -2822,6 +2930,7 @@ class MonitorService:
                 # Could this reading read a count at all? A full API answer
                 # always can; a page reading never can.
                 counts_seen=not fetch.partial or "posts_count" in parsed,
+                grid_empty=fetch.partial and parsed.get("grid_empty") is True,
             )
 
         return {
@@ -2851,6 +2960,49 @@ class MonitorService:
             # story phase reports status from THIS, never from the snapshot.
             "reel_data": reel_data_response,
         }
+
+    @staticmethod
+    def _not_found_key(account_id: int) -> str:
+        """Set when a "doesn't exist" alert goes out, cleared when the
+        account next answers. See _clear_not_found."""
+        return f"not_found_alert:{account_id}"
+
+    async def _clear_not_found(self, account_id: int, username: str) -> None:
+        """Correct a standing "doesn't exist" alert once the account answers.
+
+        Nothing used to: a target reported missing went back to normal
+        readings in silence, so the chat was left believing it was gone.
+        That is how the six false alerts of 2026-11-04 (the username API
+        answering 404 for everyone) would have stood for good. One message
+        per alert, in the account's topic.
+
+        Only an alert raised since the account last answered is corrected —
+        the marker _handle_failure sets with it. Judging by the notification
+        history instead (its newest "not found" with no correction after it)
+        corrected all 17 accounts at once on 2026-11-05: each had some old
+        alert in its 90-day history, from before corrections existed.
+        """
+        key = self._not_found_key(account_id)
+        async with get_session() as session:
+            if await crud.get_setting(session, key) is None:
+                return
+            await crud.delete_setting(session, key)
+        logger.info(
+            "@{} answers again after a \"doesn't exist\" alert — telling the "
+            "chat that alert no longer holds", username,
+        )
+        msg = render_found_again_message(username)
+        thread_id = await self.topic_for(account_id, username)
+        delivered = await self.notifier.send_text(msg, message_thread_id=thread_id)
+        async with get_session() as session:
+            await crud.log_notification(
+                session,
+                account_id=account_id,
+                change_type="found_again",
+                payload={"old": "not found", "new": "answering"},
+                message=msg,
+                delivered=delivered,
+            )
 
     @staticmethod
     def _went_public(changeset: ChangeSet) -> bool:
@@ -2989,15 +3141,31 @@ class MonitorService:
         }
 
     async def _fetch_highlight_catalog(
-        self, username: str, instagram_id: Optional[str]
+        self, username: str, instagram_id: Optional[str], *, page: bool = True
     ) -> dict[str, str]:
-        """Highlight reel id -> title via Instagram's graphql reel query (anonymous).
+        """Highlight reel id -> title, from the profile page or the reel query.
+
+        The page goes first when `page` is set: it lists a public account's
+        whole catalog in about a second (see public_page._highlight_catalog),
+        while the reel query is refused through the Worker and, by 2026-11-04,
+        login-walled even from a home IP — ~9 s per refusal, after which the
+        caller fell back to the stored catalog anyway. The reel query is asked
+        only when the page did not list all of it. A caller that already read
+        the page this check passes `page=False`.
 
         The reel query needs the numeric user id, so resolve it from the username
         when it isn't stored yet — otherwise we'd skip the working path entirely.
         The old storiesig fallback is gone (that API was discontinued).
         """
-        if not instagram_id:
+        if page:
+            outcome = await self.instagram.probe_public_page(username)
+            parsed = outcome.get("parsed") or {}
+            if parsed.get("highlights") is not None:
+                return dict(parsed["highlights"])
+            instagram_id = instagram_id or parsed.get("instagram_id")
+        elif not instagram_id:
+            # Not when the page was just asked: a profile fetch would only ask
+            # it again.
             fetch = await self.instagram.fetch_profile(username)
             if fetch.success and fetch.parsed:
                 instagram_id = fetch.parsed.get("instagram_id")
@@ -3012,11 +3180,12 @@ class MonitorService:
     ) -> list:
         """Download story items across every highlight reel in the catalog.
 
-        The reel ids come from Instagram's graphql query (anonymous); the media
-        itself comes from saveinsta.to per reel. Failures on individual reels are
-        swallowed so one bad reel never sinks the rest. When `cancellable`, a
-        /kill aborts the in-flight reel fetches and returns nothing — so a huge
-        catalog can be stopped before the (longer) delivery phase even begins.
+        The reel ids come from Instagram's own catalog; the media itself comes
+        per reel from storynavigation (fresh copies only), else saveinsta.
+        Failures on individual reels are swallowed so one bad reel never sinks
+        the rest. When `cancellable`, a /kill aborts the in-flight reel fetches
+        and returns nothing — so a huge catalog can be stopped before the
+        (longer) delivery phase even begins.
         """
         if self.stories is None or not catalog:
             return []
@@ -3062,15 +3231,27 @@ class MonitorService:
         return items
 
     def _media_unavailable(self, since: float) -> str:
-        """The error for a download saveinsta sent nothing for, `since` being
-        when the download started. When saveinsta said why, pass its words on;
-        guessing at a rate limit hid that it had stopped serving highlights
-        ("Video is private." for every public account)."""
-        reason = self.stories.refusal_since(since) if self.stories else None
-        if reason is None:
+        """The error for a download no anonymous source served, `since` being
+        when the download started. Every source that said why is quoted:
+        guessing at a rate limit hid that saveinsta had stopped serving
+        highlights ("Video is private." for every public account), and
+        storynavigation's usual reason is that it only had an old copy."""
+        if self.stories is None:
             return _DOWNLOAD_UNAVAILABLE_MSG
+        reasons = []
+        storynav = self.stories.highlight_failure_since(since)
+        if storynav:
+            reasons.append(f"storynavigation {storynav}")
+        refusal = self.stories.refusal_since(since)
+        if refusal:
+            reasons.append(f"saveinsta refused it: “{refusal}”")
+        if not reasons:
+            return _DOWNLOAD_UNAVAILABLE_MSG
+        text = "; ".join(reasons)
+        if not text.endswith(("”", ".")):
+            text += "."
         return (
-            f"saveinsta, the anonymous media source, refused it: “{reason}” "
+            f"No anonymous source served it — {text} "
             "Highlight names and story status still work."
         )
 
@@ -3082,10 +3263,14 @@ class MonitorService:
         curr_ids = set(current)
         added = [(hid, current[hid]) for hid in sorted(curr_ids - prev_ids)]
         removed = [(hid, previous[hid]) for hid in sorted(prev_ids - curr_ids)]
+        # Titles are compared without invisible bidi marks: the page strips
+        # them and the reel query may not, and an RTL title such as
+        # @opscn1's "حسوني moshi" must not read as renamed to itself when
+        # the catalog's source changes.
         renamed = [
             (hid, previous[hid], current[hid])
             for hid in sorted(prev_ids & curr_ids)
-            if previous[hid] != current[hid]
+            if strip_bidi(previous[hid] or "") != strip_bidi(current[hid] or "")
         ]
         return added, removed, renamed
 
@@ -3107,6 +3292,57 @@ class MonitorService:
     @staticmethod
     def _highlight_scan_key(account_id: int) -> str:
         return f"highlight_scan:{account_id}"
+
+    @staticmethod
+    def _quiet_reels_key(account_id: int) -> str:
+        return f"highlight_quiet_reels:{account_id}"
+
+    async def _hold_back_first_listings(
+        self,
+        account_id: int,
+        username: str,
+        items: list,
+        previous_catalog: dict[str, str],
+        catalog: dict[str, str],
+    ) -> set[str]:
+        """The reels of `items` that were in the catalog when highlight media
+        came back (storynavigation, 2026-11-05) and are listed for the first
+        time since: their items are recorded as seen, not delivered — the way
+        an account's first sweep is a baseline. Returns those reel ids.
+
+        No highlight item could be listed for two weeks before that, and the
+        ids recorded earlier came from saveinsta's links, which need not match
+        storynavigation's: without this, a reel's first listing would deliver
+        its old media as if new. A reel that joins the catalog later is news
+        and is delivered, however many of its listings fail first
+        (storynavigation fails about half of its fetches).
+        """
+        key = self._quiet_reels_key(account_id)
+        async with get_session() as session:
+            raw = await crud.get_setting(session, key)
+        # The first time through: the reels the account had until this check.
+        pending = _json_ids(raw) if raw is not None else set(previous_catalog)
+        listed = {item.highlight_id for item in items if item.highlight_id}
+        held = listed & pending
+        remaining = pending - listed
+        if catalog:
+            remaining &= set(catalog)  # a deleted reel needs no quiet listing
+        if raw is None or remaining != pending:
+            async with get_session() as session:
+                if held:
+                    await crud.mark_story_items_seen(
+                        session, account_id,
+                        [item for item in items if item.highlight_id in held],
+                    )
+                await crud.set_setting(session, key, json.dumps(sorted(remaining)))
+        if held:
+            logger.info(
+                "@{}: first listing of {} reel(s) since highlight media came back "
+                "— their {} item(s) recorded as seen, not delivered",
+                username, len(held),
+                sum(1 for item in items if item.highlight_id in held),
+            )
+        return held
 
     @classmethod
     def _highlight_scan_overdue(
@@ -3202,18 +3438,19 @@ class MonitorService:
 
         A page-derived `reel_data` is topped up from the phone's own reel
         answer when one has landed for this account — free, already fetched,
-        and the only source for the live flag and the highlight catalog while
-        the username API is shut. Nothing is asked for here to get it.
+        and the only source for the live flag (and for the highlight catalog
+        when the page did not list all of it) while the username API is shut.
+        Nothing is asked for here to get it.
 
         `catalog_due` allows ONE live reel call for the highlight catalog
         when nothing free carried it and this account's catalog is past its
         re-scan interval. It is the only thing that overrides the
         don't-re-ask rule, because it is the only thing that rule gets wrong:
-        the story status the page already answered, the catalog it never
-        can. The caller caps how many accounts get this per sweep.
+        the story status the page already answered, a catalog the page did
+        not list. The caller caps how many accounts get this per sweep.
         """
         assert self.stories is not None
-        async with self._story_semaphore:
+        async with self._account_lock(account_id, "story"), self._story_semaphore:
             try:
                 async with get_session() as session:
                     previous_catalog = await crud.get_highlight_catalog(
@@ -3228,15 +3465,16 @@ class MonitorService:
                 # result down, so this costs nothing on a healthy check. Only a
                 # failed/absent profile check reaches Instagram again here.
                 # A page-derived status arrives with the reel route already
-                # refused this check: don't knock again, and leave the stored
-                # highlight catalog as it is.
+                # refused this check: don't knock again. Its highlight catalog
+                # is the page's own list when Instagram listed all of it there;
+                # otherwise the stored catalog stands as it is.
                 if reel_data is not None and reel_data.get("from_page") and instagram_id:
                     # The page answered the story question, and the phone's
                     # reel answer for this account has since landed — it was
                     # asked for at the top of the sweep and arrives after the
                     # pages. Reading it costs nothing: no request, no wait.
-                    # It carries the two things the page never knows, the live
-                    # flag and the highlight catalog. The page keeps the story
+                    # It carries the live flag, which the page never knows, and
+                    # the reel query's own catalog. The page keeps the story
                     # flag: that is this check's own live reading, and the one
                     # already weighed against the stored baseline.
                     in_hand = self.instagram.reel_in_hand(str(instagram_id))
@@ -3244,7 +3482,11 @@ class MonitorService:
                         reel_data = {
                             **reel_data,
                             "is_live": bool(in_hand.get("is_live")),
-                            "highlights": in_hand.get("highlights") or {},
+                            "highlights": (
+                                in_hand.get("highlights")
+                                or reel_data.get("highlights")
+                                or {}
+                            ),
                         }
                         logger.debug(
                             "@{}: filled the live flag and the highlight "
@@ -3281,20 +3523,21 @@ class MonitorService:
                     # only that rule. The rule is right about the STATUS: the
                     # page already said whether a story is up, so knocking on
                     # the refused reel route for it buys an answer already in
-                    # hand. It is wrong about the CATALOG, which the page has
-                    # never carried and nothing else can supply — there the
-                    # answer is not known, it is simply missing, and refusing
-                    # to ask is how a stored catalog ages without anyone
-                    # noticing. The caller has already capped how many
-                    # accounts may reach this per sweep.
+                    # hand. It is wrong about a CATALOG the page did not list
+                    # in full — there the answer is not known, it is simply
+                    # missing, and refusing to ask is how a stored catalog
+                    # ages without anyone noticing. The caller has already
+                    # capped how many accounts may reach this per sweep.
                     if attempted_reel:
                         logger.info(
                             "@{}: re-reading the highlight catalog — the page "
-                            "answered the story question but has never known "
-                            "the reels, and this catalog is due", username,
+                            "answered the story question but did not list the "
+                            "whole catalog, and this catalog is due", username,
                         )
+                    # The check already read the page (or failed to), so only
+                    # the reel query is left to ask.
                     catalog = await self._fetch_highlight_catalog(
-                        username, instagram_id
+                        username, instagram_id, page=False
                     )
                     if catalog:
                         logger.info(
@@ -3486,6 +3729,11 @@ class MonitorService:
                             self._highlight_scan_key(account_id),
                             str(time.time()),
                         )
+                        # Everything listed is seen already, so no reel is
+                        # left owing a quiet first listing.
+                        await crud.set_setting(
+                            session, self._quiet_reels_key(account_id), "[]"
+                        )
                     logger.info(
                         "Established story/highlight baseline for @{} ({} reels, {} items)",
                         username,
@@ -3560,8 +3808,12 @@ class MonitorService:
                             self._highlight_scan_key(account_id),
                             str(time.time()),
                         )
+                held = await self._hold_back_first_listings(
+                    account_id, username, highlight_items, previous_catalog, catalog
+                )
                 new_highlight_items = [
-                    i for i in highlight_items if i.pk and i.pk not in seen_pks
+                    i for i in highlight_items
+                    if i.pk and i.pk not in seen_pks and i.highlight_id not in held
                 ]
                 if new_highlight_items:
                     await self._deliver_story_items(
@@ -3798,6 +4050,7 @@ class MonitorService:
         *,
         first_seen: bool,
         counts_seen: bool = True,
+        grid_empty: bool = False,
     ) -> None:
         """Download and send new feed posts/reels.
 
@@ -3813,6 +4066,12 @@ class MonitorService:
         no count is readable the LISTING is the detector instead, run at most
         once per POST_SCAN_INTERVAL per account and deduplicated against
         seen_stories exactly as the count-triggered path is.
+
+        `grid_empty` is the page's own listing of the grid: none, and no next
+        page (see public_page._grid_empty). That IS a listing, so it is
+        stamped as one, and saveinsta is not asked: it answers an empty grid
+        with "Video is private.", which made both 0-post public targets read
+        as a failed listing that "asks again" every sweep.
         """
         if self.stories is None:
             return
@@ -3834,6 +4093,17 @@ class MonitorService:
                 "@{}: listing the grid — no post count is readable from this "
                 "source, so a rise cannot be what triggers it", username,
             )
+
+        if grid_empty:
+            async with get_session() as session:
+                await crud.set_setting(
+                    session, self._post_scan_key(account_id), str(time.time())
+                )
+            logger.info(
+                "@{}: grid listed by the page — no posts, so nothing to "
+                "compare", username,
+            )
+            return
 
         try:
             posts = await self.stories.fetch_posts(username)
@@ -3929,7 +4199,7 @@ class MonitorService:
         key = self._public_grab_key(account_id)
         async with get_session() as session:
             raw = await crud.get_setting(session, key)
-        attempts = int(raw) if raw and raw.isdigit() else 0
+        attempts = int(raw) if raw and raw.isdecimal() else 0
         if went_public and attempts == 0:
             attempts = 1
         if attempts == 0:
@@ -4302,7 +4572,8 @@ class MonitorService:
     async def list_highlights(self, username: str) -> dict:
         """Return the current highlight reels (id + title) for any public account.
 
-        Pulls the live catalog from Instagram's anonymous graphql reel query. For
+        Pulls the live catalog from the profile page, or from Instagram's
+        anonymous graphql reel query when the page does not list all of it. For
         monitored accounts it also refreshes the stored catalog and falls back to
         the last stored catalog if the live fetch yields nothing.
         Returns {"ok": bool, "items": list[(id, title)], "error": Optional[str]}.
@@ -4313,8 +4584,8 @@ class MonitorService:
         account_id = account.id if account else None
         instagram_id = account.instagram_id if account else None
 
-        # The highlight catalog (names + ids) comes from Instagram's own graphql
-        # reel query, which works anonymously (the id is resolved from the
+        # The highlight catalog (names + ids) comes from the page, else from
+        # Instagram's own graphql reel query (the id is resolved from the
         # username inside _fetch_highlight_catalog when not already known).
         catalog: dict[str, str] = {}
         try:
@@ -4373,7 +4644,7 @@ class MonitorService:
             }
 
         highlight_id, title = items[index]
-        # Anonymous media fetch (no login) via saveinsta.to.
+        # Anonymous media fetch (no login): storynavigation, else saveinsta.
         since = time.monotonic()
         try:
             story_items = await self.stories.fetch_highlight_items(
@@ -4592,6 +4863,7 @@ class MonitorService:
         is_private: Optional[bool] = None
         posts_count: Optional[int] = None
         highlight_count: Optional[int] = None
+        page_catalog: Optional[dict[str, str]] = None
         fetch = await self.instagram.fetch_profile(username)
         if fetch.success and fetch.parsed:
             parsed = fetch.parsed
@@ -4599,6 +4871,9 @@ class MonitorService:
             posts_count = parsed.get("posts_count")
             highlight_count = parsed.get("story_count")  # = highlight_reel_count
             instagram_id = instagram_id or parsed.get("instagram_id")
+            # A page reading lists the whole catalog itself (see
+            # public_page._highlight_catalog) — no second request for it.
+            page_catalog = parsed.get("highlights")
         elif fetch.http_status == 404:
             return {
                 "ok": False, "items": [], "monitored": account_id is not None,
@@ -4611,7 +4886,14 @@ class MonitorService:
 
         catalog: dict[str, str] = {}
         try:
-            catalog = await self._fetch_highlight_catalog(username, instagram_id)
+            if page_catalog is not None:
+                catalog = dict(page_catalog)
+            else:
+                # Not the page again: the profile fetch above went there
+                # whenever the API refused, and it listed no whole catalog.
+                catalog = await self._fetch_highlight_catalog(
+                    username, instagram_id, page=False
+                )
         except Exception as exc:  # pragma: no cover - network failure path
             logger.warning(
                 "Bulk-download highlight catalog failed for @{}: {}", username, exc

@@ -24,7 +24,7 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "x")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "x")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./test.db")
 
-from app.monitor.instagram import InstagramClient
+from app.monitor.instagram import InstagramClient  # noqa: E402
 
 
 EXPECTED = {

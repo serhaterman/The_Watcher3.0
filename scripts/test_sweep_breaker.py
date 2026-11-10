@@ -20,6 +20,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -242,6 +243,113 @@ async def test_staggered_check_defers_after_open() -> None:
     expect("throttle counted the skips", t.skipped == 3, repr(t.skipped))
 
 
+async def test_queued_checks_skip_the_moment_it_opens() -> None:
+    """Measured 2026-11-05: the breaker opened on the 5th of 17 accounts, and
+    the 12 checks queued behind it each sat out its pacing gap (widened by the
+    blocks) before being skipped — 150 s between "stopping the sweep" and the
+    deferral. A check now skips as soon as the breaker is open."""
+    service = MonitorService(
+        instagram=AsyncMock(), hasher=AsyncMock(),
+        notifier=AsyncMock(), stories=None,
+    )
+    calls: list[str] = []
+    tripped_at: list[float] = []
+
+    async def fake_run_check(account_id, username, **kw):
+        calls.append(username)
+        if len(calls) == 3:
+            tripped_at.append(time.monotonic())  # its 401 opens the breaker
+        return {"ok": False, "username": username, "status": 401, "error": "blocked"}
+
+    service._run_check = fake_run_check  # type: ignore[assignment]
+    t = _SweepThrottle(base_stagger=0.1, max_stagger=0.5, breaker_threshold=3)
+    results = await asyncio.gather(
+        *(service._staggered_check(t, i, f"user{i}") for i in range(10))
+    )
+    after = time.monotonic() - tripped_at[0]
+    expect("only the three blocks that opened it were fetched", len(calls) == 3, repr(calls))
+    expect("the seven queued checks are deferred",
+           sum(1 for r in results if r.get("skipped")) == 7 and t.skipped == 7, repr(t.skipped))
+    # Unfixed, each waited its 0.4-0.5 s gap plus up to 0.8 s of noise: >= 3.4 s.
+    expect("without sitting out their gaps", after < 0.5, f"{after:.2f}s after the breaker opened")
+
+    t = _SweepThrottle(base_stagger=5.0, max_stagger=5.0, breaker_threshold=1)
+    async with t.slot():
+        pass  # the next check may not leave for 5 s or more
+
+    async def block_soon() -> None:
+        await asyncio.sleep(0.1)
+        t.record(401)  # nothing has answered: the breaker opens at once
+
+    start = time.monotonic()
+    blocker = asyncio.ensure_future(block_soon())
+    async with t.slot():
+        woke = time.monotonic() - start
+    await blocker
+    expect("a check already waiting out its gap wakes when it opens",
+           t.is_open() and woke < 1.0, f"woke after {woke:.2f}s")
+
+
+def test_each_page_exit_gets_its_own_count() -> None:
+    """Blocks are counted per page-tunnel exit: one Instagram refuses says
+    nothing about the next."""
+    t = _SweepThrottle(base_stagger=0.0, max_stagger=0.0, breaker_threshold=5)
+    for _ in range(3):
+        t.record(401, page_exit="RO-FREE#22 (185.252.220.117)")
+    for _ in range(2):
+        t.record(401, page_exit="RO-FREE#30 (146.70.246.171)")
+    expect("five blocks across two exits do not trip the breaker", not t.is_open())
+    t.record(401, page_exit=None)  # the tunnel between exits: the page left from this host
+    expect("a check while the tunnel moves does not start the count over",
+           t._consecutive_auth_fails == 3, repr(t._consecutive_auth_fails))
+    for _ in range(2):
+        t.record(401, page_exit="RO-FREE#30 (146.70.246.171)")
+    expect("five blocks on one exit still do", t.is_open())
+
+
+async def test_a_sweep_reaches_the_exit_that_answers() -> None:
+    """The 2026-11-05 13:08 UTC sweep, replayed: three blocks on RO-FREE#22
+    moved the tunnel to RO-FREE#30, two more there tripped the breaker at
+    five, and the 12 accounts left were deferred — while NL-FREE#158 answered
+    all 17 five minutes later. Each exit now gets its own count."""
+    service = MonitorService(
+        instagram=AsyncMock(), hasher=AsyncMock(), notifier=AsyncMock(), stories=None,
+    )
+    exits = [("RO-FREE#22", "185.252.220.117"), ("RO-FREE#30", "146.70.246.171"),
+             ("NL-FREE#158", "185.107.56.154")]
+    tunnel = SimpleNamespace(up=True, label=exits[0][0], egress_ip=exits[0][1])
+    refused_here = 0
+    calls: list[tuple[str, str]] = []
+
+    async def fake_run_check(account_id, username, **kw):
+        nonlocal refused_here
+        calls.append((username, tunnel.label))
+        if tunnel.label == "NL-FREE#158":
+            return {"ok": True, "username": username, "status": 200}
+        refused_here += 1
+        if refused_here == 3:  # the page door's breaker trips: the tunnel moves on
+            index = [label for label, _ in exits].index(tunnel.label)
+            tunnel.label, tunnel.egress_ip = exits[index + 1]
+            refused_here = 0
+        return {"ok": False, "username": username, "status": 401, "id_status": 401,
+                "error": "login page"}
+
+    service._run_check = fake_run_check  # type: ignore[assignment]
+    old_tunnel = page_tunnel.tunnel
+    page_tunnel.tunnel = tunnel
+    try:
+        t = _SweepThrottle(base_stagger=0.0, max_stagger=0.0, breaker_threshold=5)
+        results = [await service._staggered_check(t, i, f"user{i}") for i in range(17)]
+    finally:
+        page_tunnel.tunnel = old_tunnel
+    expect("the sweep reaches the third exit instead of stopping at five blocks",
+           not t.is_open() and len(calls) == 17 and calls[-1][1] == "NL-FREE#158",
+           repr(calls[-3:]))
+    expect("every account after it answers, none is deferred",
+           sum(1 for r in results if r.get("status") == 200) == 11 and t.skipped == 0,
+           repr([r.get("status") for r in results]))
+
+
 def test_gate_down_stops_instead_of_pausing() -> None:
     """A sweep where NOTHING answers is not a throttle to pace around — it is
     the gate shut. One worker call is 8 upstream attempts, so walking the rest
@@ -422,6 +530,9 @@ async def main() -> int:
     await test_id_only_retries_stop_when_a_round_recovers_nothing()
     await test_retry_budget_stops_a_long_outage()
     await test_staggered_check_defers_after_open()
+    await test_queued_checks_skip_the_moment_it_opens()
+    test_each_page_exit_gets_its_own_count()
+    await test_a_sweep_reaches_the_exit_that_answers()
 
     await dispose_engine()
     print()

@@ -347,6 +347,70 @@ async def test_blocked_page_keeps_the_original_error() -> None:
     expect("no invented data", result.parsed is None, repr(result.parsed))
 
 
+# What the username API has answered for EVERY username since 2026-11-04,
+# @instagram included: an HTML "Page Not Found", status 404.
+API_NOT_FOUND_PAGE = "<!DOCTYPE html><html><head><title>Page Not Found &bull; Instagram</title></head></html>"
+
+
+async def _fetch_with_api_404(page: _MockResponse):
+    def handler(url: str, params: dict, headers: dict) -> _MockResponse:
+        if "instagram.com/rein__saad/" in url:
+            return page
+        return _MockResponse(404, {}, text=API_NOT_FOUND_PAGE)
+
+    session = _MockSession(handler)
+    old = settings.ig_proxy_url
+    settings.ig_proxy_url = "https://ig-proxy.example.workers.dev"
+    try:
+        async with InstagramClient(max_retries=5, session=session) as client:
+            result = await client.fetch_profile("rein__saad", auth_attempts=1)
+    finally:
+        settings.ig_proxy_url = old
+    return result, session
+
+
+async def test_an_api_404_is_not_a_verdict() -> None:
+    """The API's 404 stopped meaning anything on 2026-11-04 — it says it for
+    @instagram too. Read as "User not found", it kept the working page door
+    from ever being asked, and live accounts were reported missing."""
+    result, session = await _fetch_with_api_404(_MockResponse(200, text=PAGE))
+
+    expect("an API 404 falls through to the page", result.success,
+           repr((result.http_status, result.error)))
+    expect("and the page's reading is used",
+           result.source == "public_page"
+           and (result.parsed or {}).get("following_count") == 567,
+           repr(result.parsed))
+    expect("the API is booked as refusing, so a sweep stops knocking",
+           result.api_status in (401, 403), repr(result.api_status))
+    expect("asked once — a re-ask answers the same",
+           sum(1 for u in session.urls if "workers.dev" in u) == 1,
+           repr(session.urls))
+
+
+async def test_an_api_404_with_the_page_shut_is_a_block() -> None:
+    """Both doors shut after an API 404 is a block, not "not found": that
+    status is what sends the per-account "not found" alert."""
+    result, _ = await _fetch_with_api_404(_MockResponse(200, text=PAGE_LOGIN_WALL))
+
+    expect("a failure", not result.success)
+    expect("reported as a refusal, not a 404",
+           result.http_status == 401, repr(result.http_status))
+    expect("the error still says what the API answered",
+           "404" in (result.error or ""), repr(result.error))
+
+
+async def test_the_page_s_own_404_still_says_gone() -> None:
+    """The page's 404 IS an answer (its refusals are login redirects and
+    429s), so a username that really is gone is still reported."""
+    result, _ = await _fetch_with_api_404(_MockResponse(404, text=API_NOT_FOUND_PAGE))
+
+    expect("the page's 404 stands", result.http_status == 404,
+           repr((result.http_status, result.error)))
+    expect("and is credited to the page", result.source == "public_page",
+           result.source)
+
+
 def test_bidi_marks_never_alert() -> None:
     """Instagram's og:title wraps RTL names in invisible direction marks; the
     API doesn't. Alternating between the sources reported "Full name changed
@@ -491,6 +555,9 @@ async def main() -> int:
     await test_purge_removes_only_the_og_era_rows()
     await test_no_fallback_when_the_api_answers()
     await test_blocked_page_keeps_the_original_error()
+    await test_an_api_404_is_not_a_verdict()
+    await test_an_api_404_with_the_page_shut_is_a_block()
+    await test_the_page_s_own_404_still_says_gone()
 
     print()
     if FAILURES:

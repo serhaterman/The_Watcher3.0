@@ -746,7 +746,7 @@ async def test_the_page_answers_the_story_question_when_the_reel_route_is_refuse
 async def test_a_manual_check_skips_a_door_known_to_be_shut() -> None:
     """Someone is waiting on a Recheck: no ten-second knocks on a door the
     last sweep found shut. The id route and the pages still run."""
-    account_id = await _new_account("manual_skip")
+    await _new_account("manual_skip")
     await _set_door(True)
     ig = ScriptedInstagram()
     ig.probe = lambda i: _answered(i, "manual_skip")
@@ -1088,6 +1088,49 @@ async def test_the_phone_answers_the_reel_question() -> None:
     finally:
         settings.ig_proxy_url, settings.home_fetch_token, home_fetch.broker = old_proxy, old_token, old_broker
         await _set_door(False)
+
+
+async def test_a_sweep_stops_knocking_on_a_refusing_worker() -> None:
+    """Measured 2026-11-05: the Worker's reel route refused every id and no
+    phone was connected, so every failing account of every sweep paid 8.5-9 s
+    of upstream retries. Once the breaker trips, a sweep skips the route and
+    reads its last refusal as the answer; one knock per cooldown notices it
+    opening again, and a manual check always knocks."""
+    old_proxy, old_token, old_broker = settings.ig_proxy_url, settings.home_fetch_token, home_fetch.broker
+    settings.ig_proxy_url = "https://ig-proxy.example.workers.dev"
+    settings.home_fetch_token = None
+    home_fetch.broker = FakeBroker({}, connected=False)
+    session = _MockSession(lambda url, p: _MockResponse(401, {}))
+    worker = lambda: sum(1 for r in session.requests if "workers.dev" in r["url"])  # noqa: E731
+    try:
+        async with InstagramClient(max_retries=1, session=session) as client:
+            for _ in range(3):
+                probe = await client.probe_by_id("42", ask_phone=False, knock_refusing=False)
+            expect("the refusals that trip the breaker are real knocks",
+                   worker() == 3 and probe.blocked and probe.via == "", repr((worker(), probe)))
+            probe = await client.probe_by_id("42", ask_phone=False, knock_refusing=False)
+            expect("then a sweep does not ask the refusing Worker",
+                   worker() == 3 and probe.via == "worker-shut", repr((worker(), probe)))
+            expect("and its last refusal stands as the answer",
+                   probe.blocked and probe.status == 401 and not probe.answered, repr(probe))
+            probe = await client.probe_by_id("42")
+            expect("a manual check still knocks", worker() == 4 and probe.via == "", repr((worker(), probe)))
+            client._worker_reel_blocked_until = 0.0  # the cooldown ran out
+            await client.probe_by_id("42", ask_phone=False, knock_refusing=False)
+            expect("after the cooldown a sweep knocks once", worker() == 5, repr(worker()))
+            probe = await client.probe_by_id("42", ask_phone=False, knock_refusing=False)
+            expect("and that refusal re-arms the skip at once",
+                   worker() == 5 and probe.via == "worker-shut", repr((worker(), probe)))
+
+        session = _MockSession(lambda url, p: _MockResponse(200, REEL))
+        async with InstagramClient(max_retries=1, session=session) as client:
+            client._worker_reel_failures = 7
+            client._worker_reel_blocked_until = 0.0
+            probe = await client.probe_by_id("42", ask_phone=False, knock_refusing=False)
+            expect("an answer on the knock clears the streak",
+                   probe.answered and client._worker_reel_failures == 0, repr(probe))
+    finally:
+        settings.ig_proxy_url, settings.home_fetch_token, home_fetch.broker = old_proxy, old_token, old_broker
 
 
 async def test_probe_reports_what_instagram_said() -> None:
@@ -1507,6 +1550,7 @@ async def main() -> int:
     await test_home_door_answers_when_this_host_is_refused()
     await test_this_hosts_page_door_is_skipped_after_repeated_refusals()
     await test_the_phone_answers_the_reel_question()
+    await test_a_sweep_stops_knocking_on_a_refusing_worker()
     await test_probe_reports_what_instagram_said()
 
     await test_a_failed_page_is_asked_about_by_id()

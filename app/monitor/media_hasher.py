@@ -17,6 +17,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 from app.config import settings
 from app.utils.logger import logger
+from app.utils.downloads import RefusedURL, account_media_dir, fetch_public
 
 CHROME_IMPERSONATE = "chrome120"
 
@@ -111,11 +112,14 @@ def _strip_cdn_size(url: str) -> Optional[str]:
     image; the anonymous ceiling stays profile_pic_url_hd (~320px), or the
     media downloader's full-resolution avatar.
 
-    The attempt is kept because hash_url falls back correctly (403 -> None ->
-    retry the original), and an unsigned/legacy URL would still benefit — but
-    on today's URLs it costs one guaranteed-403 round trip per download.
+    So a SIGNED url (one carrying `oh=`) is left alone: stripping it cost one
+    guaranteed-403 round trip per download. An unsigned/legacy URL is still
+    stripped, since it would benefit, and hash_url falls back correctly either
+    way (403 -> None -> retry the original).
     """
     if "fbcdn.net" not in url and "cdninstagram.com" not in url:
+        return None
+    if "oh" in parse_qs(urlparse(url).query, keep_blank_values=True):
         return None
 
     modified = False
@@ -245,13 +249,20 @@ class MediaHasher:
     async def _fetch_and_store(self, url: str, username: str) -> Optional[HashedMedia]:
         """Download one URL, hash it, and persist to disk."""
         try:
-            response = await self._client.get(
+            response = await fetch_public(
+                self._client,
                 url,
                 headers={
                     "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
                     "Referer": "https://www.instagram.com/",
                 },
             )
+        except RefusedURL as exc:
+            # Avatar URLs come from Instagram's payloads and saveinsta's
+            # HTML: never let one lead the client to a local file or this
+            # host's own network.
+            logger.warning("Not downloading a picture for @{}: {}", username, exc)
+            return None
         except RequestException as exc:
             logger.warning("Failed to download profile picture for @{}: {}", username, exc)
             return None
@@ -265,7 +276,7 @@ class MediaHasher:
 
         content = response.content
         ext = _ext_from_content_type(response.headers.get("Content-Type", "")) or ".jpg"
-        account_dir = settings.media_path / username
+        account_dir = account_media_dir(username)
 
         def _persist() -> tuple[str, Path, Optional[str]]:
             # SHA256 + disk write + PIL decode/resize/hash are all CPU/disk

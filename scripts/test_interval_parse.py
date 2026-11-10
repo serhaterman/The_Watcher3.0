@@ -15,7 +15,7 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "x")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "x")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./test.db")
 
-from app.bot.handlers import _format_interval, _parse_interval
+from app.bot.handlers import _format_interval, _parse_interval  # noqa: E402
 
 CASES = [
     ("30m", 1800),
@@ -31,6 +31,13 @@ CASES = [
     ("nope", None),
     ("0", None),
     ("0m0s", None),
+    # Found by fuzzing (2026-11-05): str.isdigit() passes superscripts, which
+    # int() cannot read — "/interval ¹" raised out of the handler. Digits from
+    # other scripts (an Arabic keyboard types ٣٠) are real numbers and work.
+    ("¹", None),
+    ("²m", None),
+    ("٣٠", 30),
+    ("٣٠m", 1800),
 ]
 
 fmt_cases = [

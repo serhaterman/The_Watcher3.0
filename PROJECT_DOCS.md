@@ -163,13 +163,15 @@ the_watcher_V3.0/
 │   │   ├── media_hasher.py  # Download & hash profile pictures
 │   │   ├── service.py       # MonitorService — orchestrate fetch/diff/persist/notify
 │   │   ├── change_detector.py # ChangeSet diffing logic
-│   │   └── stories.py       # StoriesClient — stories & highlights
+│   │   ├── stories.py       # StoriesClient — stories & highlights
+│   │   └── storynavigation.py # Highlight media, fresh copies only
 │   ├── workers/
 │   │   └── scheduler.py     # WatcherScheduler (APScheduler wrapper)
 │   └── utils/
+│       ├── downloads.py     # Media folders + fetch_public: public http(s) hosts only, every hop
 │       ├── formatting.py    # fmt_timestamp (Damascus UTC+3), fmt_number, esc, truncate
 │       ├── logger.py        # Loguru logger
-│       └── user_agents.py   # UA pool for the Cloudflare Worker
+│       └── tasks.py         # spawn(): background work that is held and reports itself
 ├── scripts/
 │   ├── test_stories.py      # End-to-end stories smoke test
 │   ├── test_ig_fetch.py     # Instagram fetch smoke test
@@ -396,7 +398,10 @@ sweep itself is paced by `_SweepThrottle`:
   and carry on (those accounts stay in this sweep). If **nothing** has
   answered, the gate is shut: stop immediately, skip the retry rounds, and
   skip the per-account reel fallback, because no pace helps and every further
-  request is blocked traffic that keeps it shut.
+  request is blocked traffic that keeps it shut. "Immediately" includes the
+  checks already queued: opening the breaker wakes the one waiting out its
+  gap, and the rest skip without a wait (until 2026-11-05 the 12 accounts
+  behind a stopped sweep sat out ~150 s of gaps just to be skipped).
 - **Nothing outruns the pacer.** `_SweepThrottle` only knows about its own
   sweep, so a stakeout ticking every two minutes, a card Recheck or `/story`
   fired unpaced requests into the middle of a paced sweep and the burst guard
@@ -560,6 +565,30 @@ Instagram's own gate, so it keeps working when the API path is 401-blocked.
 During an outage the story media still arrives; only the live *status* goes
 unknown, and the bot says so rather than guessing.
 
+**Highlight media: storynavigation.com, fresh copies only (2026-11-05).**
+saveinsta has answered "Video is private." for every highlight since
+2026-10-23, so `fetch_highlight_items` asks `app/monitor/storynavigation.py`
+first and saveinsta only when that gives nothing. storynavigation's page posts
+`{highlightId}` to `/get-highlight-stories` with the Laravel CSRF token from its
+home page (no captcha, no login of ours) and gets the reel's items as Instagram
+CDN links. Measured the same day: the first request for a reel fetches it from
+Instagram (3.5–13 s; about half of those fetches fail with an empty body), and
+whatever came back — items, or `[]` — is then served from storage for a day or
+more (0.2–0.33 s, identical signed links). Under the no-stale-data rule an
+answer counts only when it took seconds (≥ 2.5 s: this request fetched it), or
+when it is the copy this client fetched live within the last 15 minutes. A
+quick answer is refused as "only had a stored copy", an empty one as "sent
+nothing for this highlight" — never as an empty highlight — and the download
+error names every source's reason. Its own highlight list and profile data are
+never used: the list said `[]` for an account with three reels, and profiles
+are cached (natgeo's follower count did not move in 10 minutes).
+
+When highlight media came back, every reel already in a catalog was owed one
+quiet first listing (`highlight_quiet_reels:<id>`): its items are recorded as
+seen, not delivered, because two weeks of reels had no media and the ids
+recorded before came from saveinsta's links. A reel that joins the catalog
+later is always delivered, however many of its listings fail first.
+
 ### 6.7 Cloudflare Worker Proxy
 
 When Render's Frankfurt datacenter IPs are blocked by Instagram, a transparent
@@ -582,6 +611,13 @@ Cloudflare Worker proxy is used for EVERY Instagram API call:
 Set `IG_PROXY_URL` in environment variables to enable. The bot falls back to
 direct Instagram requests if the proxy is unreachable, and serves repeated
 reel queries from a 90-second in-memory cache to keep request volume low.
+
+Since 2026-11-04 the `?user_id=` route answers 401 for every id. After three
+refusals in a row it is skipped for 10 minutes: the home fetcher is asked
+first when one is connected, and a sweep without one does not ask the Worker
+at all (`probe_by_id(knock_refusing=False)` — the last refusal stands as the
+answer), so each window costs a sweep one knock instead of ~9 s on every
+failing account. A manual check always knocks.
 
 **Cloudflare edge IPs are not immune — they are just better odds.** Worth
 stating plainly, because the opposite assumption shaped earlier versions of
@@ -786,13 +822,26 @@ at 0%, a sweep of 13 failures and 4 id-only readings. Now:
   configs all stay silent goes back to the refused one, and on the same IP
   that is not a new route: the cooldown stands. When the tunnel is up and a
   sweep still reads no counts, the no-counts notice suggests adding configs
-  for more Proton free servers;
-- **boot waits for the first config only** (2026-10-21). `main.py` awaits
+  for more Proton free servers. A sweep counts its blocks **per exit**
+  (2026-11-05): `_SweepThrottle.record(page_exit=…)` starts the breaker's
+  count over when the tunnel moves on, because one exit Instagram refuses
+  says nothing about the next — three blocks on RO-FREE#22 and two on
+  RO-FREE#30 had tripped it at five before NL-FREE#158, which answered all
+  17 accounts minutes later, was tried. Refused exits recover after a rest:
+  NL-FREE#158, refused at 11:12 UTC, served every page at 13:13;
+- **a restart starts on the exit that last worked** (2026-11-05). The first
+  page Instagram serves through each exit calls `report_answered`, and
+  `main.py` keeps that config's label in app_settings (`page_tunnel_exit`).
+  Boot reads it (the database now opens before the tunnel) and starts there
+  instead of on the first config in the file, which after that day's deploy
+  was an exit Instagram had stopped serving — it cost the first sweep;
+- **boot waits for one config only** (2026-10-21). `main.py` awaits
   `tunnel.start()` before the app serves, and `start()` used to try every
   config in turn. On Render each silent config cost ~20 s (the DNS lookup
   for the IP check timing out inside the tunnel), so five of them kept the
-  port closed for ~100 s. Now `start()` proves the first config, as before
-  and just as bounded, and if it gives no answer, the watchdog's first look
+  port closed for ~100 s. Now `start()` proves one config — the remembered
+  exit, else the first — as before and just as bounded, and if it gives no
+  answer, the watchdog's first look
   tries the rest at once (`_boot_lap`), not after the 5-minute re-check.
   With one config, nothing changes;
 - **each config that gives no answer says why.** Before, only the last
@@ -884,6 +933,7 @@ keeps the real Chrome fingerprint. The Worker remains the free default.
 |---|---|
 | `/start` or `/menu` | Open the main panel |
 | `/add @username` | Start monitoring an account (runs first check immediately) |
+| `/addmedia @username` | Same, alerting only on stories, posts and the avatar (media-only); switches an account already monitored |
 | `/remove @username` | Stop monitoring, deletes all snapshots |
 | `/list` | Paginated list of monitored accounts |
 | `/recheck @username` | Force an immediate check |
@@ -952,25 +1002,30 @@ few requests; the media itself flows entirely through saveinsta.
 ### Authorization
 
 When `TELEGRAM_ADMIN_IDS` is set, only those Telegram user IDs can interact
-with the bot. When unset, any user can interact (suitable for personal use).
+with the bot. When unset, only the chats it reports to (`TELEGRAM_CHAT_ID` and
+the mirrors) can — until 2026-11-05 it answered anyone who found it. The
+startup log says which applies (`Telegram access: …`).
 
 ---
 
 ## 8. HTTP API
 
-All endpoints are under the FastAPI app. Optional bearer token auth via
-`WEB_API_TOKEN`.
+All endpoints are under the FastAPI app. The token is `WEB_API_TOKEN`, sent
+as the `X-API-Token` header. The two read endpoints that expose what is being
+monitored, and the two that act, all need it and answer 404 while it is unset
+(until 2026-11-05 `/accounts` listed every monitored username to anyone with
+the URL, and `/sweep` ran for anyone on a deployment without a token).
 
-| Method | Path | Description |
-|---|---|---|
-| GET | `/` | Health + endpoint list |
-| GET | `/health` | Liveness probe |
-| GET | `/ready` | Readiness probe (checks DB) |
-| GET | `/status` | Scheduler state, account counts |
-| GET | `/accounts` | List all monitored accounts |
-| POST | `/accounts/{username}/recheck` | Trigger an immediate check |
-| POST | `/sweep` | Trigger a full sweep (all accounts) |
-| POST | `/telegram/webhook` | Telegram webhook receiver |
+| Method | Path | Token | Description |
+|---|---|---|---|
+| GET | `/` | — | Health + endpoint list |
+| GET | `/health` | — | Liveness probe (Render's health check, keep-awake ping) |
+| GET | `/ready` | — | Readiness probe: monitor and scheduler state, deployed `commit` |
+| GET | `/status` | always | Scheduler state, account counts, fetch health |
+| GET | `/accounts` | always | List all monitored accounts |
+| POST | `/accounts/{username}/recheck` | if set | Trigger an immediate check |
+| POST | `/sweep` | if set | Trigger a full sweep (all accounts) |
+| POST | `/telegram/webhook` | Telegram's | Telegram webhook receiver |
 
 ---
 
@@ -993,7 +1048,7 @@ All settings are read from environment variables (or a `.env` file locally).
 | `TELEGRAM_WEBHOOK_URL` | — | Public base URL for webhook (auto-set by Render via `RENDER_EXTERNAL_URL`) |
 | `TELEGRAM_WEBHOOK_SECRET` | — | Webhook secret token — disallowed characters are stripped automatically |
 | `TELEGRAM_WEBHOOK_PATH` | `/telegram/webhook` | Webhook path |
-| `TELEGRAM_ADMIN_IDS` | — | Comma-separated Telegram user IDs allowed to use the bot |
+| `TELEGRAM_ADMIN_IDS` | — | Comma-separated Telegram user IDs allowed to use the bot; empty = only the chats it reports to |
 
 ### Instagram
 
@@ -1058,7 +1113,7 @@ All settings are read from environment variables (or a `.env` file locally).
 | Env Var | Default | Description |
 |---|---|---|
 | `MEDIA_DIR` | `./data/media` | Local directory for downloaded profile pictures |
-| `WEB_API_TOKEN` | — | Bearer token for HTTP API auth |
+| `WEB_API_TOKEN` | — | `X-API-Token` for the HTTP API; every endpoint that needs it stays disabled without it |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `PORT` | `8000` | Web server port (injected by Render automatically) |
 | `PROXY_URL` | — | Optional HTTP/HTTPS/SOCKS5 proxy for all outbound requests. Wins over `HTTP_PROXY`/`HTTPS_PROXY`. Note it wraps the whole session, so with `IG_PROXY_URL` set it applies to the hop that reaches the Worker — not to the Worker's own egress to Instagram |

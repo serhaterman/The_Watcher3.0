@@ -36,6 +36,7 @@ from app.bot.handlers import (
     remember_render,
 )
 from app.utils.logger import logger
+from app.utils.tasks import spawn
 
 
 class PanelBumper:
@@ -73,7 +74,9 @@ class PanelBumper:
         """
         if self._pending is not None and not self._pending.done():
             return
-        self._pending = asyncio.create_task(self._bump())
+        # spawn, not a bare create_task: a bump that raises is logged instead
+        # of vanishing as "Task exception was never retrieved".
+        self._pending = spawn(self._bump(), name="panel:bump")
 
     async def _bump(self) -> None:
         # Let concurrent sweep notifications all land first.

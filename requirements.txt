@@ -4,14 +4,17 @@ httpx[http2]==0.28.1
 curl_cffi==0.15.0
 sqlalchemy[asyncio]==2.0.36
 asyncpg==0.30.0
-alembic==1.14.0
 python-telegram-bot==21.9
 APScheduler==3.10.4
 pydantic==2.10.3
 pydantic-settings==2.7.0
 python-dotenv==1.2.2
-tenacity==9.0.0
 loguru==0.7.3
-fake-useragent==1.5.1
 Pillow==13.0.0
-psycopg2-binary==2.9.10
+
+# Security floors for transitive dependencies (OSV, 2026-11-05). A fresh
+# install resolves these to current releases anyway; the floors stop any
+# resolver or cache from ever installing a vulnerable one.
+h2>=4.4.1            # request smuggling: GHSA-6hr6-w5qg-qmwg, GHSA-847f-9342-265h
+certifi>=2026.10.18  # compromised emSign intermediates: GHSA-6q48-6c7w-9gw2
+idna>=3.15           # crafted-input DoS: GHSA-65pc-fj4g-8rjx, GHSA-jjg7-2v4v-x38h

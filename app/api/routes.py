@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import gzip
 import re
 import secrets
+import zlib
 from pathlib import Path
 from typing import Optional
 
@@ -25,12 +25,31 @@ from app.workers.scheduler import WatcherScheduler
 router = APIRouter()
 
 
+def _token_matches(token: Optional[str], expected: str) -> bool:
+    """Whether a header carries the expected secret. Constant-time, and
+    compared as bytes: `secrets.compare_digest` raises on a str that is not
+    ASCII, which turned a header with one odd character into a 500."""
+    return bool(token) and secrets.compare_digest(
+        token.encode("utf-8"), expected.encode("utf-8")
+    )
+
+
 def _check_token(token: Optional[str]) -> None:
-    """If WEB_API_TOKEN is set, require it on mutating endpoints."""
+    """Require WEB_API_TOKEN, and fail CLOSED: with no token configured the
+    endpoint is disabled, never open.
+
+    /accounts lists every monitored username, and until 2026-11-05 anyone
+    with the service URL could read it. The mutation endpoints were open the
+    same way on a deployment without a token: anyone could fire sweep after
+    sweep at Instagram, which is how this host's IP gets blocked. Render
+    generates the token (render.yaml), so there it is always set.
+    """
     expected = settings.web_api_token
     if not expected:
-        return
-    if not token or token != expected:
+        raise HTTPException(
+            status_code=404, detail="disabled (WEB_API_TOKEN not set)"
+        )
+    if not _token_matches(token, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing token"
         )
@@ -64,11 +83,16 @@ async def ready(request: Request) -> dict:
         "ok": bool(monitor and scheduler and scheduler.scheduler.running),
         "monitor": bool(monitor),
         "scheduler_running": bool(scheduler and scheduler.scheduler.running),
+        # Public on purpose: the one thing a deploy check needs from outside.
+        "commit": settings.render_git_commit,
     }
 
 
 @router.get("/status")
-async def status_endpoint(request: Request) -> dict:
+async def status_endpoint(
+    request: Request, x_api_token: Optional[str] = Header(default=None)
+) -> dict:
+    _check_token(x_api_token)
     async with get_session() as session:
         stats = await crud.stats_summary(session)
 
@@ -82,11 +106,13 @@ async def status_endpoint(request: Request) -> dict:
         "check_interval": settings.check_interval,
         "jitter_seconds": settings.jitter_seconds,
         "fetch_health": fetch_health.snapshot(),
+        "commit": settings.render_git_commit,
     }
 
 
 @router.get("/accounts")
-async def list_accounts() -> dict:
+async def list_accounts(x_api_token: Optional[str] = Header(default=None)) -> dict:
+    _check_token(x_api_token)
     async with get_session() as session:
         accounts = await crud.list_accounts(session, only_active=False)
 
@@ -152,7 +178,7 @@ def _check_home_token(token: Optional[str]) -> None:
         raise HTTPException(
             status_code=404, detail="home fetcher disabled (HOME_FETCH_TOKEN not set)"
         )
-    if not token or not secrets.compare_digest(token, expected):
+    if not _token_matches(token, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing token"
         )
@@ -220,6 +246,10 @@ async def home_fetch_next_job(
     return {"job": handed[0] if handed else None, "jobs": handed}
 
 
+# The largest upload the home fetcher may post, raw or inflated. A whole page
+# is ~800 KB; the payload the worker usually extracts, a few KB.
+_MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+
 # The worker script itself, bundled into the image (see the Dockerfile).
 WORKER_SCRIPT = Path(__file__).resolve().parents[2] / "tools" / "home_fetcher" / "home_fetcher.py"
 _WORKER_VERSION_RE = re.compile(r"^WORKER_VERSION = (\d+)", re.MULTILINE)
@@ -261,11 +291,26 @@ async def home_fetch_deliver(
     the body (gzip-compressed when Content-Encoding says so). {"ok": false}
     means the check that asked has already given up — nothing to do."""
     _check_home_token(x_watcher_token)
-    raw = await request.body()
+    # Bounded on both sides: the body is read in chunks up to the cap, and a
+    # gzip body is inflated no further than it either — so neither a huge
+    # upload nor a small "gzip bomb" can take the bot's memory with it.
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > _MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="body too large")
+    body = bytes(raw)
     if request.headers.get("content-encoding", "").lower() == "gzip":
+        inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
         try:
-            raw = gzip.decompress(raw)
-        except (OSError, EOFError):
+            body = inflater.decompress(body, _MAX_UPLOAD_BYTES)
+        except zlib.error:
+            raise HTTPException(status_code=400, detail="body is not valid gzip")
+        if inflater.unconsumed_tail:
+            raise HTTPException(status_code=413, detail="body too large once inflated")
+        if not inflater.eof or inflater.unused_data:
+            # Cut short, or more after the end: the worker sends one whole
+            # gzip member, and gzip.decompress refused both of these too.
             raise HTTPException(status_code=400, detail="body is not valid gzip")
     try:
         ig_status = int(x_ig_status or 0)
@@ -275,7 +320,7 @@ async def home_fetch_deliver(
         job_id,
         home_fetch.PageResult(
             status=ig_status,
-            body=raw.decode("utf-8", "replace"),
+            body=body.decode("utf-8", "replace"),
             final_url=x_ig_final_url or "",
         ),
     )
@@ -297,7 +342,9 @@ async def telegram_webhook(
     handled by python-telegram-bot's own error handlers.
     """
     expected_secret = settings.telegram_webhook_secret
-    if expected_secret and x_telegram_bot_api_secret_token != expected_secret:
+    if expected_secret and not _token_matches(
+        x_telegram_bot_api_secret_token, expected_secret
+    ):
         logger.warning("Rejected webhook with bad/missing secret header")
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid secret")
 
